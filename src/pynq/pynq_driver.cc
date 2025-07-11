@@ -92,6 +92,17 @@ uint32_t VTAReadMappedReg(void* base_addr, uint32_t offset) {
   return *((volatile uint32_t *) (reinterpret_cast<char *>(base_addr) + offset));
 }
 
+/* TODO: Copied by hand from Vivado's Memory Maps, find a way to automate this process for target zcu104
+ */
+#undef VTA_FETCH_ADDR
+#define VTA_FETCH_ADDR 0x00A0000000
+#undef VTA_LOAD_ADDR
+#define VTA_LOAD_ADDR 0x00A0001000
+#undef VTA_COMPUTE_ADDR
+#define VTA_COMPUTE_ADDR 0x00A0002000
+#undef VTA_STORE_ADDR
+#define VTA_STORE_ADDR 0x00A0003000
+
 class VTADevice {
  public:
   VTADevice() {
@@ -165,3 +176,5 @@ int VTADeviceRun(VTADeviceHandle handle,
   return static_cast<VTADevice*>(handle)->Run(
       insn_phy_addr, insn_count, wait_cycles);
 }
+
+void VTARuntimeShutdown() {}
