@@ -181,7 +181,13 @@ void TlppVerify::TlppSynchronization(Run_Function run_function,
      * Pick a random core to run first.
      */
     unsigned int seed = time(NULL);
-    uint8_t core_start = rand_r(&seed)%COREMAX;
+    uint8_t core_start =
+#ifdef _MSC_VER
+    // Windows does not have reentrancy problems
+    rand()%COREMAX;
+#else
+    rand_r(&seed)%COREMAX;
+#endif
     for (int i = 0; i < COREMAX; i++) {
       CoreRun(static_cast<CORE_TYPE>((core_start + i) % COREMAX));
     }
