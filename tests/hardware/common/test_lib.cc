@@ -23,6 +23,9 @@
  */
 
 #include "test_lib.h"
+#ifdef _WIN32
+  #define rand_r(x) rand()
+#endif
 
 #ifdef NO_SIM
 #ifdef VTA_TARGET_PYNQ

@@ -30,14 +30,14 @@ def get_vta_hw_path():
     curr_path = os.path.dirname(os.path.abspath(os.path.expanduser(__file__)))
     vta_hw_default = os.path.abspath(os.path.join(curr_path, ".."))
     VTA_HW_PATH = os.getenv('VTA_HW_PATH', vta_hw_default)
-    return VTA_HW_PATH
+    return VTA_HW_PATH.replace("\\", "/")
 
 def get_tvm_path():
     """Get the TVM path."""
     curr_path = os.path.dirname(os.path.abspath(os.path.expanduser(__file__)))
     tvm_default = os.path.abspath(os.path.join(curr_path, "../../.."))
     TVM_PATH = os.getenv('TVM_PATH', tvm_default)
-    return TVM_PATH
+    return TVM_PATH.replace("\\", "/")
 
 class PkgConfig(object):
     """Simple package config tool for VTA.

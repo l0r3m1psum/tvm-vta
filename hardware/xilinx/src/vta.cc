@@ -393,6 +393,13 @@ void alu(
               acc_T shr_val = src_0 >> shft_by;
               dst_tensor[i][b] = shr_val;
               o_tensor[i][b] = (out_T) shr_val.range(VTA_OUT_WIDTH - 1, 0);
+#if 0
+            } else if (insn.alu_opcode == VTA_ALU_OPCODE_MUL) {
+              // Compute Multiply
+              acc_T mul_val = src_0 * mul_by;
+              dst_tensor[i][b] = mul_val;
+              o_tensor[i][b] = (out_T) mul_val.range(VTA_OUT_WIDTH - 1, 0);
+ #endif
             }
           }
         }
