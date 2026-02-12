@@ -7,7 +7,9 @@ then
 	mkdir -p ~/bin
 	ln -s /usr/bin/python3 ~/bin/python
 	sudo apt install build-essentials libc6-dev-i386 zip
+	# https://docs.amd.com/r/en-US/76960/
 	echo Apply this patch 'https://adaptivesupport.amd.com/s/article/76960'
+	echo and this patch 'https://adaptivesupport.amd.com/s/article/75516'
 	echo Make sure you are on the following PYNQ release https://github.com/Xilinx/PYNQ/releases/tag/v2.5
 fi
 
