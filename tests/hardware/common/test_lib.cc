@@ -346,6 +346,7 @@ VTAGenericInsn getGEMMInsn(int uop_offset, int batch, int in_feat, int out_feat,
   insn.push_prev_dep = push_prev_dep;
   insn.push_next_dep = push_next_dep;
   insn.reset_reg = false;
+  insn.binary = false;
   if (!uop_compression) {
     insn.uop_bgn = uop_offset;
     insn.uop_end = uop_offset + batch * in_feat * out_feat;

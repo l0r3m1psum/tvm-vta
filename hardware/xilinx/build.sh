@@ -13,7 +13,7 @@ fi
 
 lsb_release -rs | grep -q '^18\.' || echo Warning you are not running on Ubuntu 18
 
-cp -f ../../config/zcu104_sample.json ../../config/vta_conf.json
+cp -f ../../config/zcu104_sample.json ../../config/vta_config.json
 rm -rf ../../build
 # https://adaptivesupport.amd.com/s/question/0D52E00006hpJpSSAU/
 LIBRARY_PATH=/usr/lib/x86_64-linux-gnu make cleanall

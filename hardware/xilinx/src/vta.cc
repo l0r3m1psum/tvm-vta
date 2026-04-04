@@ -22,6 +22,10 @@
  * \brief VTA HLS design.
  */
 
+/* Some multiplications are forced to be synthesized as Mul_LUT instead of a DSP
+ * slice because all the DSP slices are already used by the rest of the design.
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,7 +40,6 @@ void reset_mem(
 
   for (int i = 0; i < range; i ++) {
     for (int j = 0; j < MAT_AXI_RATIO; j ++) {
-#pragma HLS UNROLL
       mem[sram_idx][j] = 0;
     }
     sram_idx ++;
@@ -56,12 +59,11 @@ void load_pad_2d(
   memop_pad_T x_pad_1,
   memop_sram_T y_offset_0,
   memop_sram_T y_offset_1) {
-#pragma HLS INLINE
 
   reset_mem<DATA_T, MAT_AXI_RATIO>(sram_idx, y_offset_0, dst);
   for (int y = 0; y < y_size; y++) {
-#pragma HLS PIPELINE
     reset_mem<DATA_T, MAT_AXI_RATIO>(sram_idx, x_pad_0, dst);
+#pragma HLS DEPENDENCE variable=dst inter false
     memcpy(&dst[sram_idx][0],
            (const DATA_T*) &src[dram_idx * MAT_AXI_RATIO],
            x_size * ELEM_BYTES);
@@ -81,9 +83,9 @@ void load_2d(
   memop_size_T y_size,
   memop_size_T x_size,
   memop_stride_T x_stride) {
-#pragma HLS INLINE
 
   for (int y = 0; y < y_size; y++) {
+#pragma HLS DEPENDENCE variable=dst inter false
     memcpy(&dst[sram_idx][0],
            (const DATA_T*) &src[dram_idx * MAT_AXI_RATIO],
            x_size * ELEM_BYTES);
@@ -199,8 +201,8 @@ void load(
   // Pre-processing
   memop_sram_T x_width = (insn.x_pad_0 + insn.x_size + insn.x_pad_1);
   memop_sram_T y_offset_0 = x_width * insn.y_pad_0;
-#pragma HLS RESOURCE variable = y_offset_0 core = Mul_LUT latency = 4
   memop_sram_T y_offset_1 = x_width * insn.y_pad_1;
+#pragma HLS RESOURCE variable = y_offset_0 core = Mul_LUT latency = 4
 #pragma HLS RESOURCE variable = y_offset_1 core = Mul_LUT latency = 4
 
   if (insn.memory_type == VTA_MEM_ID_INP) {
@@ -231,6 +233,24 @@ void load(
   if (insn.push_next_dep) {
     l2g_dep_queue.write(1);
   }
+}
+
+ap_int<17> popcnt(ap_uint<17> data_in) {
+#pragma HLS PIPELINE II=1
+  ap_uint<6> s0 = data_in(5, 0);
+  ap_uint<6> s1 = data_in(11, 6);
+  ap_uint<5> s2 = data_in(16, 12);
+
+  // two 6:3 and one 5:3 compressors (LUT6 and LUT5)
+  ap_uint<3> c0 = s0[0] + s0[1] + s0[2] + s0[3] + s0[4] + s0[5];
+  ap_uint<3> c1 = s1[0] + s1[1] + s1[2] + s1[3] + s1[4] + s1[5];
+  ap_uint<3> c2 = s2[0] + s2[1] + s2[2] + s2[3] + s2[4];
+
+  // pipeline here
+
+  ap_uint<5> total = c0 + c1 + c2;
+
+  return total;
 }
 
 void gemm(
@@ -295,6 +315,9 @@ void gemm(
             for (int ic = 0; ic < VTA_BLOCK_IN; ic++) {
               wgt_T w_elem = w_tensor[oc][ic];
               inp_T i_elem = i_tensor[b][ic];
+#if 0
+              mul_T prod_dsp = insn.binary ? popcnt(i_elem ^ w_elem) : (mul_T)(i_elem * w_elem);
+#endif
               mul_T prod_dsp = i_elem * w_elem;
               tmp += (sum_T) prod_dsp;
             }
@@ -535,13 +558,10 @@ void store(
 #pragma HLS INTERFACE s_axilite port = return bundle = CONTROL_BUS
 #pragma HLS RESOURCE variable = out_mem core = RAM_1P
 
-  // Pop store instruction
   insn_T raw_insn = store_queue.read();
-  // Cast to MemInsn
   insn_T raw_copy = raw_insn;
   VTAMemInsn insn = *((VTAMemInsn *) &raw_copy);
 
-  // Pop dependence token if instructed
   if (insn.pop_prev_dep) {
     g2s_dep_queue.read();
   }

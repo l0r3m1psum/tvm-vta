@@ -154,6 +154,8 @@ typedef struct {
   uint64_t push_next_dep  : 1;
   /*! \brief Reset register */
   uint64_t reset_reg      : 1;
+  /*! \brief Parameters are packed binary */
+  uint64_t binary         : 1;
   /*! \brief Micro-op begin address */
   uint64_t uop_bgn        : VTA_LOG_UOP_BUFF_DEPTH;
   /*! \brief Micro-op end address */
