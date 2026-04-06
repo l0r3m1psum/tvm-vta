@@ -2,6 +2,7 @@
 
 if false
 then
+	echo Install Vivado 2020.1 and its update from 'https://www.xilinx.com/support/download/index.html/content/xilinx/en/downloadNav/vivado-design-tools/archive.html'
 	xsetup -b ConfigGen
 	xsetup --agree XilinxEULA,3rdPartyEULA ,WebTalk --batch Install --config ~/.Xilinx/install_config.txt
 	mkdir -p ~/bin
