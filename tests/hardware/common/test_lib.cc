@@ -141,10 +141,9 @@ const char* getOpcodeString(int opcode, bool use_imm) {
     }
   } else if (opcode == VTA_ALU_OPCODE_SHR) {
     return "shr";
+  } else if (opcode == VTA_ALU_OPCODE_MUL) {
+    return "mul";
   }
-  // else if (opcode == VTA_ALU_OPCODE_MUL) {
-  //   return "mul";
-  // }
   return "unknown op";
 }
 
@@ -745,11 +744,10 @@ int alu_test(int opcode, bool use_imm, int batch, int vector_size, bool uop_comp
     } else if (opcode == VTA_ALU_OPCODE_SHR) {
       immediate[b] = static_cast<acc_T>(
           rand_r(&globalSeed) % (1LL << (VTA_SHR_ARG_BIT_WIDTH - 1)) - (1LL << (VTA_SHR_ARG_BIT_WIDTH - 2)));
+    } else if (opcode == VTA_ALU_OPCODE_MUL) {
+      immediate[b] = static_cast<acc_T>(
+          rand_r(&globalSeed) % (1LL << (VTA_MUL_ARG_BIT_WIDTH - 1)) - (1LL << (VTA_MUL_ARG_BIT_WIDTH - 2)));
     }
-    // else if (opcode == VTA_ALU_OPCODE_MUL) {
-    //   immediate[b] = static_cast<acc_T>(
-    //       rand_r(&globalSeed) % (1LL << (VTA_MUL_ARG_BIT_WIDTH - 1)) - (1LL << (VTA_MUL_ARG_BIT_WIDTH - 2)));
-    // }
   }
 
   // Initialize instructions
@@ -824,6 +822,9 @@ int alu_test(int opcode, bool use_imm, int batch, int vector_size, bool uop_comp
       } else if (opcode == VTA_ALU_OPCODE_SHR) {
         inputs[i][j] = static_cast<acc_T>(
             rand_r(&globalSeed) % (1LL << (VTA_SHR_ARG_BIT_WIDTH - 1)) - (1LL << (VTA_SHR_ARG_BIT_WIDTH - 2)));
+      } else if (opcode == VTA_ALU_OPCODE_MUL) {
+        inputs[i][j] = static_cast<acc_T>(
+            rand_r(&globalSeed) % (1LL << (VTA_MUL_ARG_BIT_WIDTH - 1)) - (1LL << (VTA_MUL_ARG_BIT_WIDTH - 2)));
       }
     }
   }
@@ -834,7 +835,8 @@ int alu_test(int opcode, bool use_imm, int batch, int vector_size, bool uop_comp
     for (int j = 0; j < vector_size; j++) {
       acc_T out_val = 0;
       acc_T imm_val = immediate[i / VTA_BATCH];
-      acc_T src_val = inputs[i][j + vector_size];
+      // With use_imm there is only one input set, so this would be out of bounds
+      acc_T src_val = use_imm ? imm_val : inputs[i][j + vector_size];
       if (opcode == VTA_ALU_OPCODE_MIN) {
         if (!use_imm) {
           out_val = inputs[i][j] < src_val ? inputs[i][j] : src_val;
@@ -867,6 +869,9 @@ int alu_test(int opcode, bool use_imm, int batch, int vector_size, bool uop_comp
             out_val = inputs[i][j] << (0 - imm_val);
           }
         }
+      } else if (opcode == VTA_ALU_OPCODE_MUL) {
+        // The hardware only uses the low VTA_MUL_ARG_BIT_WIDTH bits of src_val
+        out_val = inputs[i][j] * static_cast<int8_t>(src_val);
       }
       outputs_ref[i][j] = (out_T) out_val;
     }

@@ -7,7 +7,9 @@ from pathlib import Path
 
 ROOT_DIR = Path.cwd()
 VTA_HW_DIR = (ROOT_DIR / "../../").resolve() 
-BUILD_DIR = VTA_HW_DIR / "build" / "hardware" / "xilinx"
+# Long Windows paths break Vivado, so the build directory can be moved to a
+# shorter location (e.g. D:/vta-build) with VTA_BUILD_DIR.
+BUILD_DIR = Path(os.environ.get("VTA_BUILD_DIR", VTA_HW_DIR / "build")).resolve() / "hardware" / "xilinx"
 SCRIPT_DIR = ROOT_DIR / "scripts"
 SRC_DIR = ROOT_DIR / "src"
 
@@ -38,6 +40,10 @@ CONFIG_TCL = INCLUDE_DIR / "vta_config.tcl"
 
 IP_PATH = IP_BUILD_PATH / "vta_compute" / "soln" / "impl" / "ip" / "xilinx_com_hls_compute_1_0.zip"
 BIT_PATH = HW_BUILD_PATH / "export" / f"{CONF}.bit"
+
+# Vivado fails to create its per-user Tcl Store in %APPDATA% and emits a
+# CRITICAL WARNING (Common 17-739) every time, so give it one in the build dir.
+os.environ.setdefault("XILINX_TCLSTORE_USERAREA", str(BUILD_DIR / "tclstore"))
 
 def run_command(cmd, cwd=None):
     cmd_str = " ".join(str(x) for x in cmd)

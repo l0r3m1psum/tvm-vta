@@ -35,6 +35,31 @@ if { [llength $argv] eq 2 } {
   return 1
 }
 
+# IP generation of the block design randomly fails on Windows (Vivado 2020.1)
+# with "Could not create slave interpreter '::ipgen_iptclns'". It is a race
+# between Vivado's threads the first time IPs are generated in a session: with
+# all the cores 4 fresh sessions out of 5 failed, pinned to one core 0 out of 5.
+# So the process is pinned to one core until the runs are launched (they would
+# inherit the affinity), with a retry of the generation as fallback.
+#
+# There is a patch for 2024.2 and it is fixed in 2025.2
+# https://adaptivesupport.amd.com/s/article/000037163
+#
+# It is not a long path problem, it also fails with paths under 150 characters
+# https://adaptivesupport.amd.com/s/question/0D5KZ000010tNsX0AU
+proc process_affinity {{mask ""}} {
+  set prop "(Get-Process -Id [pid]).ProcessorAffinity"
+  if {$mask eq ""} {
+    return [string trim [exec powershell -NoProfile -Command "\[int64\]$prop"]]
+  }
+  exec powershell -NoProfile -Command "$prop = $mask"
+}
+
+set pinned [expr {$tcl_platform(platform) eq "windows" && ![catch {process_affinity} affinity]}]
+if {$pinned} {
+  process_affinity 1
+}
+
 # Source vta config variables
 source $vta_config
 
@@ -437,8 +462,24 @@ add_files -norecurse $proj_path/$proj_name.srcs/sources_1/bd/$proj_name/hdl/${pr
 update_compile_order -fileset sources_1
 update_compile_order -fileset sim_1
 
+set bd_file [get_files $proj_path/$proj_name.srcs/sources_1/bd/$proj_name/$proj_name.bd]
+set gen_ok 0
+for {set try 1} {$try <= 3 && !$gen_ok} {incr try} {
+  if {[catch {generate_target all $bd_file} err]} {
+    puts "generate_target failed (try $try): $err"
+    catch {interp delete ::ipgen_iptclns}
+    catch {reset_target all $bd_file}
+  } else {
+    set gen_ok 1
+  }
+}
+if {$pinned} {
+  process_affinity $affinity
+}
+
 # Run bistream generation on 8 threads with performance oriented P&R strategy
 set num_threads 8
+set_property strategy Performance_ExplorePostRoutePhysOpt [get_runs impl_1]
 launch_runs impl_1 -to_step write_bitstream -jobs $num_threads
 wait_on_run impl_1
 

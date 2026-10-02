@@ -185,8 +185,9 @@ class PkgConfig(object):
             self.fpga_family = "zynq-7000"
             self.fpga_board = None
             self.fpga_board_rev = None
-            self.fpga_freq = 100
-            self.fpga_per = 7
+            # 7 ns clock, the HLS period is tighter to leave margin for routing
+            self.fpga_freq = 142.857
+            self.fpga_per = 6
             self.fpga_log_axi_bus_width = 6
             self.axi_prot_bits = '000'
             # IP register address map
