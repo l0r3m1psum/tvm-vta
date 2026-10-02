@@ -582,8 +582,8 @@ PRAGMA_HLS(HLS INTERFACE s_axilite port = done bundle = CONTROL_BUS offset = VTA
     memop_dram_T dram_idx = insn.mem.dram_base;
     memop_sram_T x_width =
         (insn.mem.x_pad_0 + insn.mem.x_size + insn.mem.x_pad_1);
-    memop_sram_T y_offset_0 = x_width * insn.mem.y_pad_0;
-    memop_sram_T y_offset_1 = x_width * insn.mem.y_pad_1;
+    memop_sram_T y_offset_0 = pad_offset(x_width, insn.mem.y_pad_0);
+    memop_sram_T y_offset_1 = pad_offset(x_width, insn.mem.y_pad_1);
 
     if (insn.mem.memory_type == VTA_MEM_ID_UOP) {
       // Perform data transfer

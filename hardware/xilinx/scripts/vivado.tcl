@@ -174,6 +174,7 @@ set proc_sys_reset \
 set pll_clk [ create_bd_cell -type ip -vlnv xilinx.com:ip:clk_wiz:6.0 pll_clk ]
 set_property -dict [ list \
   CONFIG.CLKOUT1_REQUESTED_OUT_FREQ $clock_freq \
+  CONFIG.PRIM_SOURCE {Global_buffer} \
   CONFIG.RESET_PORT {resetn} \
   CONFIG.RESET_TYPE {ACTIVE_LOW} \
   CONFIG.USE_LOCKED {false} \
@@ -321,6 +322,11 @@ if { $device_family eq "zynq-7000" } {
     CONFIG.PCW_USE_S_AXI_ACP {1} \
     CONFIG.preset {ZC702} \
   ] $processing_system
+  # Make the DDR and MIO pins top-level ports, otherwise the pin constraints of
+  # the processing system can't be applied
+  apply_bd_automation -rule xilinx.com:bd_rule:processing_system7 \
+    -config {make_external "FIXED_IO, DDR" apply_board_preset "0" Master "Disable" Slave "Disable"} \
+    $processing_system
   # Get ports that are specific to the Zynq 7000 processing system
   set ps_clk    [get_bd_pins processing_system/FCLK_CLK0]
   set ps_rstn   [get_bd_pins processing_system/FCLK_RESET0_N]
