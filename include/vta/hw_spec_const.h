@@ -133,6 +133,8 @@
 #define VTA_ALU_OPCODE_SHR 3
 /*! ALU opcode: mul */
 #define VTA_ALU_OPCODE_MUL 4
+/*! ALU opcode: shift in sign bit */
+#define VTA_ALU_OPCODE_PACK_SIGN 5
 
 /*! Memory type field bitwidth */
 #define VTA_MEMOP_ID_BIT_WIDTH 3

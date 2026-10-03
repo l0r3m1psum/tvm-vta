@@ -226,11 +226,12 @@ VTAGenericInsn get1DLoadStoreInsn(int opcode, int type, int sram_offset, int dra
 * \param pop_next_dep Pop dependence from next stage.
 * \param push_prev_dep Push dependence to previous stage.
 * \param push_next_dep Push dependence to next stage.
+* \param binary The inputs and weights are packed bits (1 is +1, 0 is -1).
 * \return A VTAGenericInsn for a GEMM op.
 */
 VTAGenericInsn getGEMMInsn(int uop_offset, int batch, int in_feat, int out_feat,
   bool uop_compression, int pop_prev_dep, int pop_next_dep, int push_prev_dep,
-  int push_next_dep);
+  int push_next_dep, bool binary = false);
 
 /*!
 * \brief Returns a VTA ALU instruction for map type operation.
@@ -333,8 +334,10 @@ int blocked_gemm_test(int batch, int channels, int block, bool uop_compression,
 * \param in_channels Input channels.
 * \param out_channels Output channels.
 * \param uop_compression Apply micro-op compression.
+* \param binary Test the binary GEMM (packed bits, 1 is +1 and 0 is -1).
 * \return Number of errors from the test run.
 */
-int gemm_test(int batch, int in_channels, int out_channels, bool uop_compression);
+int gemm_test(int batch, int in_channels, int out_channels, bool uop_compression,
+              bool binary = false);
 
 #endif  //  TESTS_HARDWARE_COMMON_TEST_LIB_H_

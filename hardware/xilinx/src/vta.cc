@@ -257,23 +257,27 @@ void load(
   }
 }
 
-ap_int<17> popcnt(ap_uint<17> data_in) {
-#pragma HLS PIPELINE II=1
-  ap_uint<6> s0 = data_in(5, 0);
-  ap_uint<6> s1 = data_in(11, 6);
-  ap_uint<5> s2 = data_in(16, 12);
+// Binary GEMM only uses LUTs and shares the accumulators with the integer GEMM.
+#if VTA_INP_WIDTH == VTA_WGT_WIDTH
+#define VTA_BINARY_GEMM
+#define VTA_BINARY_BITS (VTA_BLOCK_IN * VTA_INP_WIDTH)
 
-  // two 6:3 and one 5:3 compressors (LUT6 and LUT5)
-  ap_uint<3> c0 = s0[0] + s0[1] + s0[2] + s0[3] + s0[4] + s0[5];
-  ap_uint<3> c1 = s1[0] + s1[1] + s1[2] + s1[3] + s1[4] + s1[5];
-  ap_uint<3> c2 = s2[0] + s2[1] + s2[2] + s2[3] + s2[4];
+typedef ap_uint<VTA_LOG_BLOCK_IN + VTA_LOG_INP_WIDTH + 1> popcount_T;
 
-  // pipeline here
-
-  ap_uint<5> total = c0 + c1 + c2;
-
-  return total;
+// The first level is made of 6:3 compressors (3 LUT6 each)
+popcount_T popcount(ap_uint<VTA_BINARY_BITS> bits) {
+#pragma HLS INLINE
+  popcount_T count = 0;
+  for (int i = 0; i < VTA_BINARY_BITS; i += 6) {
+    ap_uint<3> ones = 0;
+    for (int j = i; j < i + 6 && j < VTA_BINARY_BITS; j++) {
+      ones += (ap_uint<1>) (bits >> j);
+    }
+    count += ones;
+  }
+  return count;
 }
+#endif
 
 void gemm(
   insn_T insn_raw,
@@ -329,6 +333,23 @@ void gemm(
     // Output tensor
     out_T o_tensor[VTA_BATCH][VTA_BLOCK_OUT];
 
+    // Binary dot products, used in place of the integer ones when insn.binary
+    sum_T bin_tensor[VTA_BATCH][VTA_BLOCK_OUT];
+    for (int b = 0; b < VTA_BATCH; b++) {
+      for (int oc = 0; oc < VTA_BLOCK_OUT; oc++) {
+#ifdef VTA_BINARY_GEMM
+        ap_uint<VTA_BINARY_BITS> diff = 0;
+        for (int ic = 0; ic < VTA_BLOCK_IN; ic++) {
+          ap_uint<VTA_INP_WIDTH> diff_elem = i_tensor[b][ic] ^ w_tensor[oc][ic];
+          diff |= (ap_uint<VTA_BINARY_BITS>) diff_elem << (ic * VTA_INP_WIDTH);
+        }
+        bin_tensor[b][oc] = VTA_BINARY_BITS - 2 * popcount(diff);
+#else
+        bin_tensor[b][oc] = 0;
+#endif
+      }
+    }
+
     // Inner GEMM loop
 #if VTA_INP_WIDTH == 8 && VTA_WGT_WIDTH == 8 && VTA_BLOCK_OUT % 2 == 0
     // Two products sharing the same input element are computed with a
@@ -347,7 +368,8 @@ void gemm(
           tmp[1] += (ap_int<17>) (prod_dsp >> 16) + (ap_uint<1>) prod_dsp[15];
         }
         for (int k = 0; k < 2; k++) {
-          acc_T accum = a_tensor[b][oc + k] + (acc_T) tmp[k];
+          sum_T dot = insn.binary ? bin_tensor[b][oc + k] : tmp[k];
+          acc_T accum = a_tensor[b][oc + k] + (acc_T) dot;
           a_tensor[b][oc + k] = insn.reset_reg ? (acc_T) 0 : accum;
           o_tensor[b][oc + k] = (out_T) accum.range(VTA_OUT_WIDTH - 1, 0);
         }
@@ -364,11 +386,11 @@ void gemm(
         for (int ic = 0; ic < VTA_BLOCK_IN; ic++) {
           wgt_T w_elem = w_tensor[oc][ic];
           inp_T i_elem = i_tensor[b][ic];
-#if 0
-          mul_T prod_dsp = insn.binary ? popcnt(i_elem ^ w_elem) : (mul_T)(i_elem * w_elem);
-#endif
           mul_T prod_dsp = i_elem * w_elem;
           tmp += (sum_T) prod_dsp;
+        }
+        if (insn.binary) {
+          tmp = bin_tensor[b][oc];
         }
         // Update summation
         accum += (acc_T) tmp;
@@ -487,6 +509,11 @@ void alu(
           acc_T mul_val = src_0 * mul_by;
           dst_tensor[i][b] = mul_val;
           o_tensor[i][b] = (out_T) mul_val.range(VTA_OUT_WIDTH - 1, 0);
+        } else if (insn.alu_opcode == VTA_ALU_OPCODE_PACK_SIGN) {
+          // Compute Shift in the sign bit
+          acc_T pack_val = (src_0 << 1) | (acc_T) (src_1 >= 0);
+          dst_tensor[i][b] = pack_val;
+          o_tensor[i][b] = (out_T) pack_val.range(VTA_OUT_WIDTH - 1, 0);
         }
       }
     }

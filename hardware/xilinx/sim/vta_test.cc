@@ -47,6 +47,8 @@ int main(void) {
     status |= alu_test(VTA_ALU_OPCODE_SHR, true, VTA_BLOCK_OUT, 128, false);
     status |= alu_test(VTA_ALU_OPCODE_MUL, true, VTA_BLOCK_OUT, 128, true);
     status |= alu_test(VTA_ALU_OPCODE_MUL, true, VTA_BLOCK_OUT, 128, false);
+    status |= alu_test(VTA_ALU_OPCODE_PACK_SIGN, true, VTA_BLOCK_OUT, 128, true);
+    status |= alu_test(VTA_ALU_OPCODE_PACK_SIGN, true, VTA_BLOCK_OUT, 128, false);
 
     // Run ALU test (vector-vector operators)
     status |= alu_test(VTA_ALU_OPCODE_MIN, false, VTA_BLOCK_OUT, 128, true);
@@ -59,6 +61,8 @@ int main(void) {
     status |= alu_test(VTA_ALU_OPCODE_SHR, false, VTA_BLOCK_OUT, 128, false);
     status |= alu_test(VTA_ALU_OPCODE_MUL, false, VTA_BLOCK_OUT, 128, true);
     status |= alu_test(VTA_ALU_OPCODE_MUL, false, VTA_BLOCK_OUT, 128, false);
+    status |= alu_test(VTA_ALU_OPCODE_PACK_SIGN, false, VTA_BLOCK_OUT, 128, true);
+    status |= alu_test(VTA_ALU_OPCODE_PACK_SIGN, false, VTA_BLOCK_OUT, 128, false);
 
     // Run blocked GEMM test
     status |= blocked_gemm_test(256, 256, VTA_BLOCK_OUT*4, false, 2);
@@ -66,6 +70,10 @@ int main(void) {
 
     // Simple GEMM unit test
     status |= gemm_test(4 * VTA_BATCH, 4 * VTA_BLOCK_OUT, 4 * VTA_BLOCK_IN, false);
+
+    // Binary GEMM unit test (the inputs and weights are packed bits)
+    status |= gemm_test(4 * VTA_BATCH, 4 * VTA_BLOCK_OUT, 4 * VTA_BLOCK_IN, false, true);
+    status |= gemm_test(4 * VTA_BATCH, 4 * VTA_BLOCK_OUT, 4 * VTA_BLOCK_IN, true, true);
 
     return status;
 }

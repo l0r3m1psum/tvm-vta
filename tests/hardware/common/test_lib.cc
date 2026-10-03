@@ -143,6 +143,8 @@ const char* getOpcodeString(int opcode, bool use_imm) {
     return "shr";
   } else if (opcode == VTA_ALU_OPCODE_MUL) {
     return "mul";
+  } else if (opcode == VTA_ALU_OPCODE_PACK_SIGN) {
+    return "pack sign";
   }
   return "unknown op";
 }
@@ -334,7 +336,7 @@ VTAGenericInsn get1DLoadStoreInsn(int opcode, int type, int sram_offset, int dra
 
 VTAGenericInsn getGEMMInsn(int uop_offset, int batch, int in_feat, int out_feat,
     bool uop_compression, int pop_prev_dep, int pop_next_dep, int push_prev_dep,
-    int push_next_dep) {
+    int push_next_dep, bool binary) {
   // Converter
   union VTAInsn converter;
   // GEMM instruction initialization
@@ -345,7 +347,7 @@ VTAGenericInsn getGEMMInsn(int uop_offset, int batch, int in_feat, int out_feat,
   insn.push_prev_dep = push_prev_dep;
   insn.push_next_dep = push_next_dep;
   insn.reset_reg = false;
-  insn.binary = false;
+  insn.binary = binary;
   if (!uop_compression) {
     insn.uop_bgn = uop_offset;
     insn.uop_end = uop_offset + batch * in_feat * out_feat;
@@ -744,7 +746,7 @@ int alu_test(int opcode, bool use_imm, int batch, int vector_size, bool uop_comp
     } else if (opcode == VTA_ALU_OPCODE_SHR) {
       immediate[b] = static_cast<acc_T>(
           rand_r(&globalSeed) % (1LL << (VTA_SHR_ARG_BIT_WIDTH - 1)) - (1LL << (VTA_SHR_ARG_BIT_WIDTH - 2)));
-    } else if (opcode == VTA_ALU_OPCODE_MUL) {
+    } else if (opcode == VTA_ALU_OPCODE_MUL || opcode == VTA_ALU_OPCODE_PACK_SIGN) {
       immediate[b] = static_cast<acc_T>(
           rand_r(&globalSeed) % (1LL << (VTA_MUL_ARG_BIT_WIDTH - 1)) - (1LL << (VTA_MUL_ARG_BIT_WIDTH - 2)));
     }
@@ -822,7 +824,7 @@ int alu_test(int opcode, bool use_imm, int batch, int vector_size, bool uop_comp
       } else if (opcode == VTA_ALU_OPCODE_SHR) {
         inputs[i][j] = static_cast<acc_T>(
             rand_r(&globalSeed) % (1LL << (VTA_SHR_ARG_BIT_WIDTH - 1)) - (1LL << (VTA_SHR_ARG_BIT_WIDTH - 2)));
-      } else if (opcode == VTA_ALU_OPCODE_MUL) {
+      } else if (opcode == VTA_ALU_OPCODE_MUL || opcode == VTA_ALU_OPCODE_PACK_SIGN) {
         inputs[i][j] = static_cast<acc_T>(
             rand_r(&globalSeed) % (1LL << (VTA_MUL_ARG_BIT_WIDTH - 1)) - (1LL << (VTA_MUL_ARG_BIT_WIDTH - 2)));
       }
@@ -872,6 +874,9 @@ int alu_test(int opcode, bool use_imm, int batch, int vector_size, bool uop_comp
       } else if (opcode == VTA_ALU_OPCODE_MUL) {
         // The hardware only uses the low VTA_MUL_ARG_BIT_WIDTH bits of src_val
         out_val = inputs[i][j] * static_cast<int8_t>(src_val);
+      } else if (opcode == VTA_ALU_OPCODE_PACK_SIGN) {
+        // Shift in 1 if the source is >= 0 and 0 otherwise
+        out_val = inputs[i][j] * 2 + (src_val >= 0 ? 1 : 0);
       }
       outputs_ref[i][j] = (out_T) out_val;
     }
@@ -1228,15 +1233,16 @@ int blocked_gemm_test(int batch, int channels, int block, bool uop_compression,
 }
 
 
-int gemm_test(int batch, int in_channels, int out_channels, bool uop_compression) {
+int gemm_test(int batch, int in_channels, int out_channels, bool uop_compression,
+              bool binary) {
   // Some assertions
   assert(batch % VTA_BATCH == 0);
   assert(in_channels % VTA_BLOCK_IN == 0);
   assert(out_channels % VTA_BLOCK_OUT == 0);
 
   printf("=====================================================================================\n");
-  printf("INFO - Blocked GEMM test: batch=%d, in_channels=%d, out_channels=%d, uop_comp=%d\n",
-         batch, in_channels, out_channels, uop_compression);
+  printf("INFO - Blocked GEMM test: batch=%d, in_channels=%d, out_channels=%d, uop_comp=%d, binary=%d\n",
+         batch, in_channels, out_channels, uop_compression, binary);
 
   // Derive number of elements that need to be loaded/stored
   int ins_size = 7;
@@ -1311,7 +1317,8 @@ int gemm_test(int batch, int in_channels, int out_channels, bool uop_compression
       1,                                                  // pop_prev_dep
       0,                                                  // pop_next_dep
       0,                                                  // push prev dep
-      1);                                                 // push_next_dep
+      1,                                                  // push_next_dep
+      binary);                                            // binary
   // Store output block (pop prev, push prev if not last)
   insn_buf[insn_idx++] = get1DLoadStoreInsn(
       VTA_OPCODE_STORE,                                   // opcode
@@ -1352,7 +1359,19 @@ int gemm_test(int batch, int in_channels, int out_channels, bool uop_compression
     for (int j = 0; j < out_channels; j++) {
       acc_T sum = biases[i][j];
       for (int k = 0; k < in_channels; k++) {
-        sum += (acc_T) (inputs[i][k] * weights[j][k]);
+        if (binary) {
+          // The elements are packed bits (1 is +1, 0 is -1), their dot product
+          // is the number of equal bits minus the number of different bits
+          int diff = (static_cast<int>(inputs[i][k]) ^ static_cast<int>(weights[j][k])) &
+              ((1 << VTA_INP_WIDTH) - 1);
+          int different = 0;
+          for (int bit = 0; bit < VTA_INP_WIDTH; bit++) {
+            different += (diff >> bit) & 1;
+          }
+          sum += (acc_T) (VTA_INP_WIDTH - 2 * different);
+        } else {
+          sum += (acc_T) (inputs[i][k] * weights[j][k]);
+        }
       }
       // Set
       outputs_ref[i][j] = (out_T) sum;
