@@ -321,6 +321,8 @@ if { $device_family eq "zynq-7000" } {
     CONFIG.PCW_USE_DEFAULT_ACP_USER_VAL {1} \
     CONFIG.PCW_USE_S_AXI_ACP {1} \
     CONFIG.preset {ZC702} \
+    CONFIG.PCW_USE_FABRIC_INTERRUPT {1} \
+    CONFIG.PCW_IRQ_F2P_INTR {1} \
   ] $processing_system
   # Make the DDR and MIO pins top-level ports, otherwise the pin constraints of
   # the processing system can't be applied
@@ -434,6 +436,14 @@ connect_bd_net -net processing_system_clk \
   [get_bd_pins s2g_queue/s_aclk] \
   $maxi_clk \
   $saxi_clk
+
+# The interrupt raised by the FINISH instruction goes to the first PL to PS
+# interrupt line (IRQ_F2P[0])
+if { $device_family eq "zynq-7000" } {
+  connect_bd_net -net compute_0_done_irq \
+    [get_bd_pins compute_0/done_irq] \
+    [get_bd_pins processing_system/IRQ_F2P]
+}
 
 # Create address segments
 create_bd_addr_seg -range $ip_reg_map_range -offset $fetch_base_addr [get_bd_addr_spaces processing_system/Data] [get_bd_addr_segs fetch_0/s_axi_CONTROL_BUS/Reg] SEG_fetch_0_Reg

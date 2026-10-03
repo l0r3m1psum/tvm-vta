@@ -162,6 +162,8 @@ void load(
 *   queues accordingly.
 * \param done Signal that indicates that VLA is done.  AXI-lite memory mapped
 *   register.
+* \param done_irq Interrupt line, high from a FINISH instruction until the next
+*   instruction is executed.
 * \param uops Micro-op data base address in DRAM. AXI-4 master port.
 * \param biases Bias data base address in DRAM. AXI-4 master port.
 * \param gemm_queue GEMM instruction queue. AXI-stream FIFO.
@@ -179,6 +181,7 @@ void load(
 */
 void compute(
   volatile uint32_t &done,
+  bool &done_irq,
   volatile uop_T *uops,
   volatile bus_T *biases,
   hls::stream<insn_T> &gemm_queue,

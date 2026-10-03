@@ -547,6 +547,7 @@ void alu(
 
 void compute(
   volatile uint32_t &done,
+  bool &done_irq,
   volatile uop_T *uops,
   volatile bus_T *biases,
   hls::stream<insn_T> &gemm_queue,
@@ -558,6 +559,7 @@ void compute(
   bus_T wgt_mem[VTA_WGT_BUFF_DEPTH][WGT_MAT_AXI_RATIO],
   bus_T out_mem[VTA_ACC_BUFF_DEPTH][OUT_MAT_AXI_RATIO]) {
 PRAGMA_HLS(HLS INTERFACE s_axilite port = done bundle = CONTROL_BUS offset = VTA_COMPUTE_DONE_WR_OFFSET)
+#pragma HLS INTERFACE ap_none port = done_irq
 #pragma HLS INTERFACE m_axi port = uops offset = slave bundle = uop_port
 #pragma HLS INTERFACE m_axi port = biases offset = slave bundle = data_port
 #pragma HLS INTERFACE axis port = gemm_queue
@@ -599,6 +601,7 @@ PRAGMA_HLS(HLS INTERFACE s_axilite port = done bundle = CONTROL_BUS offset = VTA
 
   // Set done value
   done = 0;
+  done_irq = insn.generic.opcode == VTA_OPCODE_FINISH;
   // Perform action based on opcode
   if (insn.generic.opcode == VTA_OPCODE_FINISH) {
     // Set done flag if we reach a FINISH instruction
@@ -744,6 +747,7 @@ void vta(
 
   // Global done indicator
   uint32_t done = 0;
+  bool done_irq = false;
 
   // Temporary instructions
   insn_T tmp_load;
@@ -799,7 +803,7 @@ void vta(
         // Push the instruction in the load queue
         gemm_queue.write(tmp_gemv);
         tmp_gemm_popped = false;
-        compute(done, uops, biases, gemm_queue, l2g_dep_queue, s2g_dep_queue,
+        compute(done, done_irq, uops, biases, gemm_queue, l2g_dep_queue, s2g_dep_queue,
                 g2l_dep_queue, g2s_dep_queue, inp_mem, wgt_mem, out_mem);
       } else {
         // Execution of load stage pending on completion of other stages,
