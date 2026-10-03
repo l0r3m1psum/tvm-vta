@@ -422,9 +422,22 @@ class Device {
                 uint32_t acc_offset = i * VTA_BLOCK_OUT + j;
                 int32_t sum = acc.GetSigned(acc_offset);
                 for (uint32_t k = 0; k < VTA_BLOCK_IN; ++k) {
-                  sum +=
-                      inp.GetSigned(i * VTA_BLOCK_IN + k) *
-                      wgt.GetSigned(j * VTA_BLOCK_IN + k);
+                  int32_t inp_elem = inp.GetSigned(i * VTA_BLOCK_IN + k);
+                  int32_t wgt_elem = wgt.GetSigned(j * VTA_BLOCK_IN + k);
+                  if (op->binary) {
+                    // The elements are packed bits (1 is +1, 0 is -1), their
+                    // dot product is bits - 2 * popcount(input xor weight)
+                    CHECK_EQ(VTA_INP_WIDTH, VTA_WGT_WIDTH);
+                    uint32_t diff = static_cast<uint32_t>(inp_elem ^ wgt_elem) &
+                        ((1u << VTA_INP_WIDTH) - 1);
+                    int32_t different = 0;
+                    for (; diff != 0; diff >>= 1) {
+                      different += diff & 1;
+                    }
+                    sum += VTA_INP_WIDTH - 2 * different;
+                  } else {
+                    sum += inp_elem * wgt_elem;
+                  }
                 }
                 acc.SetSigned(acc_offset, sum);
               }
@@ -489,6 +502,13 @@ class Device {
       case VTA_ALU_OPCODE_MUL: {
         return RunALULoop<use_imm>(op, [](int32_t x, int32_t y) {
             return x * y;
+          });
+      }
+      case VTA_ALU_OPCODE_PACK_SIGN: {
+        // Shift left by one and shift in 1 if the source is >= 0
+        return RunALULoop<use_imm>(op, [](int32_t x, int32_t y) {
+            return static_cast<int32_t>(
+                (static_cast<uint32_t>(x) << 1) | (y >= 0 ? 1u : 0u));
           });
       }
       default: {
