@@ -63,6 +63,10 @@ int main(void) {
     status |= alu_test(VTA_ALU_OPCODE_MUL, false, VTA_BLOCK_OUT, 128, false);
     status |= alu_test(VTA_ALU_OPCODE_PACK_SIGN, false, VTA_BLOCK_OUT, 128, true);
     status |= alu_test(VTA_ALU_OPCODE_PACK_SIGN, false, VTA_BLOCK_OUT, 128, false);
+    status |= alu_test(VTA_ALU_OPCODE_REQUANT, false, VTA_BLOCK_OUT, 128, true);
+    status |= alu_test(VTA_ALU_OPCODE_REQUANT, false, VTA_BLOCK_OUT, 128, false);
+    status |= alu_test(VTA_ALU_OPCODE_PACK_INT4, false, VTA_BLOCK_OUT, 128, true);
+    status |= alu_test(VTA_ALU_OPCODE_PACK_INT4, false, VTA_BLOCK_OUT, 128, false);
 
     // Run blocked GEMM test
     status |= blocked_gemm_test(256, 256, VTA_BLOCK_OUT*4, false, 2);
@@ -74,6 +78,28 @@ int main(void) {
     // Binary GEMM unit test (the inputs and weights are packed bits)
     status |= gemm_test(4 * VTA_BATCH, 4 * VTA_BLOCK_OUT, 4 * VTA_BLOCK_IN, false, true);
     status |= gemm_test(4 * VTA_BATCH, 4 * VTA_BLOCK_OUT, 4 * VTA_BLOCK_IN, true, true);
+
+    // GEMM unit test with packed 4 bit inputs and weights in DRAM, with signed
+    // (1) and unsigned (2) inputs
+    status |= gemm_test(4 * VTA_BATCH, 4 * VTA_BLOCK_OUT, 4 * VTA_BLOCK_IN, false, false, 1);
+    status |= gemm_test(4 * VTA_BATCH, 4 * VTA_BLOCK_OUT, 4 * VTA_BLOCK_IN, true, false, 1);
+    status |= gemm_test(4 * VTA_BATCH, 4 * VTA_BLOCK_OUT, 4 * VTA_BLOCK_IN, false, false, 2);
+    status |= gemm_test(4 * VTA_BATCH, 4 * VTA_BLOCK_OUT, 4 * VTA_BLOCK_IN, true, false, 2);
+
+    // GEMM unit test with unsigned 8 bit inputs (inp_unsigned flag)
+    status |= gemm_test(4 * VTA_BATCH, 4 * VTA_BLOCK_OUT, 4 * VTA_BLOCK_IN, false, false, 0, true);
+    status |= gemm_test(4 * VTA_BATCH, 4 * VTA_BLOCK_OUT, 4 * VTA_BLOCK_IN, true, false, 0, true);
+
+    // Load with padding, with 8 bit elements in DRAM and with packed 4 bit
+    // elements with signed (1) and unsigned (2) inputs
+    status |= load_pad_test(6, 5, 2, 3, 0);
+    status |= load_pad_test(6, 5, 2, 3, 1);
+    status |= load_pad_test(6, 5, 2, 3, 2);
+
+    // Load of 8 bit elements in the accumulator memory with padding, sign
+    // extended and zero extended
+    status |= acc8_load_test(6, 5, 2, 3, false);
+    status |= acc8_load_test(6, 5, 2, 3, true);
 
     return status;
 }

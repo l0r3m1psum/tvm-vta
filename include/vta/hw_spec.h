@@ -98,6 +98,13 @@ typedef struct {
   uint64_t sram_base      : VTA_MEMOP_SRAM_ADDR_BIT_WIDTH;
   /*! \brief DRAM base address (pointer to memory elem type) */
   uint64_t dram_base      : VTA_MEMOP_DRAM_ADDR_BIT_WIDTH;
+  /*! \brief The DRAM holds packed 4 bit elements (the low nibble of a byte is
+   *   the first element) that are extended to 8 bits when loaded in the input
+   *   and weight memories; dram_base and x_stride count the packed elements */
+  uint64_t int4           : 1;
+  /*! \brief The elements narrower than the ones of the memory (int4 loads and
+   *   VTA_MEM_ID_ACC_8BIT loads) are zero extended instead of sign extended */
+  uint64_t is_unsigned    : 1;
   /*! \brief 2D access pattern: y-size */
   uint64_t y_size         : VTA_MEMOP_SIZE_BIT_WIDTH;
   /*! \brief 2D access pattern: x-size (in terms of memory elements) */
@@ -154,8 +161,6 @@ typedef struct {
   uint64_t push_next_dep  : 1;
   /*! \brief Reset register */
   uint64_t reset_reg      : 1;
-  /*! \brief Parameters are packed binary */
-  uint64_t binary         : 1;
   /*! \brief Micro-op begin address */
   uint64_t uop_bgn        : VTA_LOG_UOP_BUFF_DEPTH;
   /*! \brief Micro-op end address */
@@ -164,6 +169,10 @@ typedef struct {
   uint64_t iter_out       : VTA_LOOP_ITER_WIDTH;
   /*! \brief Iterations in the inner uop execution loop */
   uint64_t iter_in        : VTA_LOOP_ITER_WIDTH;
+  /*! \brief The elements of the input tensor are unsigned (unused by
+   *   VTA_OPCODE_GEMM_BINARY). It comes after the fields of the original
+   *   instruction, that keep their positions */
+  uint64_t inp_unsigned   : 1;
   /*! \brief Outer loop accumulator memory index factor */
   uint64_t dst_factor_out : VTA_LOG_ACC_BUFF_DEPTH;
   /*! \brief Inner loop accumulator memory index factor */

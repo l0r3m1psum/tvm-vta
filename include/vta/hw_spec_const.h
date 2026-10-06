@@ -122,6 +122,9 @@
 #define VTA_OPCODE_FINISH 3
 /*! Opcode: ALU encoding */
 #define VTA_OPCODE_ALU 4
+/*! Opcode: binary GEMM encoding, the inputs and the weights are packed bits
+ *  (1 is +1, 0 is -1); the instruction is the same of the GEMM one */
+#define VTA_OPCODE_GEMM_BINARY 5
 
 /*! ALU opcode: unary min op */
 #define VTA_ALU_OPCODE_MIN 0
@@ -135,6 +138,15 @@
 #define VTA_ALU_OPCODE_MUL 4
 /*! ALU opcode: shift in sign bit */
 #define VTA_ALU_OPCODE_PACK_SIGN 5
+/*! ALU opcode: requantization, the fixed point multiplication with a 64 bit
+ *  intermediate result of TFLite (single rounding) and HAWQ-V3:
+ *    dst = (dst * src + (round ? 1 << (shift - 1) : 0)) >> shift
+ *  src is always the tensor, the immediate holds shift, round and even. */
+#define VTA_ALU_OPCODE_REQUANT 6
+/*! ALU opcode: pack the low 4 bits of the elements of the accumulator tensors
+ *  src and src + 1 in the output tensor dst (the low nibble of a byte is the
+ *  first element), the inverse of an int4 load. The accumulator is not written. */
+#define VTA_ALU_OPCODE_PACK_INT4 7
 
 /*! Memory type field bitwidth */
 #define VTA_MEMOP_ID_BIT_WIDTH 3
@@ -158,6 +170,14 @@
 #define VTA_SHR_ARG_BIT_WIDTH (VTA_LOG_ACC_WIDTH)
 /*! ALU Instruction: multiply arg bitwidth*/
 #define VTA_MUL_ARG_BIT_WIDTH 8
+/*! ALU Instruction: requantization shift bitwidth, the low bits of the immediate */
+#define VTA_REQUANT_SHIFT_BIT_WIDTH 6
+/*! ALU Instruction: bit of the immediate that enables rounding to nearest in the
+ *  requantization, otherwise the result is truncated (floor) */
+#define VTA_REQUANT_ROUND_BIT 6
+/*! ALU Instruction: bit of the immediate that makes the requantization round
+ *  the ties to even (HAWQ-V3) instead of up (TFLite) */
+#define VTA_REQUANT_EVEN_BIT 7
 
 /*! Mem ID constant: uop memory */
 #define VTA_MEM_ID_UOP 0
@@ -169,7 +189,8 @@
 #define VTA_MEM_ID_ACC 3
 /*! Mem ID constant: output store buffer */
 #define VTA_MEM_ID_OUT 4
-/*! Mem ID constant: accumulator/bias memory (from int_8 buffer) */
+/*! Mem ID constant: accumulator/bias memory (from int_8 buffer), the elements
+ *  are zero extended instead of sign extended when the load is unsigned */
 #define VTA_MEM_ID_ACC_8BIT 5
 
 #endif  // VTA_HW_SPEC_CONST_H_

@@ -186,8 +186,8 @@ class PkgConfig(object):
             self.fpga_board = None
             self.fpga_board_rev = None
             # The HLS period is tighter than the clock to leave margin for routing
-            self.fpga_freq = 166.667
-            self.fpga_per = 4.5
+            self.fpga_freq = 150
+            self.fpga_per = 5.5
             self.fpga_log_axi_bus_width = 6
             self.axi_prot_bits = '000'
             # IP register address map

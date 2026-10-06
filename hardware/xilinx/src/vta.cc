@@ -42,7 +42,73 @@ void reset_mem(
   }
 }
 
-template <typename DATA_T, int MAT_AXI_RATIO, int ELEM_BYTES>
+// A load can read elements narrower than the ones of the memory and extend
+// them: packed 4 bit elements for the input and weight memories (int4 flag of
+// the instruction) and 8 bit elements for the accumulator memory
+// (VTA_MEM_ID_ACC_8BIT), see the is_unsigned flag. When a configuration does
+// not support one of them its narrow width is the one of the memory elements.
+#if VTA_INP_WIDTH == 8 && VTA_WGT_WIDTH == 8 && VTA_BUS_WIDTH == 64 && \
+    INP_MAT_AXI_RATIO % 2 == 0 && WGT_MAT_AXI_RATIO % 2 == 0
+#define VTA_INP_INT4_WIDTH 4
+#define VTA_WGT_INT4_WIDTH 4
+#else
+#define VTA_INP_INT4_WIDTH VTA_INP_WIDTH
+#define VTA_WGT_INT4_WIDTH VTA_WGT_WIDTH
+#endif
+#if VTA_ACC_WIDTH == 32 && VTA_BUS_WIDTH == 64 && ACC_MAT_AXI_RATIO % 4 == 0
+#define VTA_ACC8_WIDTH 8
+#else
+#define VTA_ACC8_WIDTH VTA_ACC_WIDTH
+#endif
+
+// Loads x_size rows of SRC_WIDTH bit elements extending them to DST_WIDTH bits.
+// The elements are packed starting from the low bits, so a row of the memory
+// comes from MAT_AXI_RATIO * SRC_WIDTH / DST_WIDTH bus words and each of them
+// is expanded in DST_WIDTH / SRC_WIDTH bus words.
+template <typename DATA_T, int MAT_AXI_RATIO, int SRC_WIDTH, int DST_WIDTH>
+void load_extend(
+  volatile DATA_T *src,
+  DATA_T dst[][MAT_AXI_RATIO],
+  memop_sram_T sram_idx,
+  memop_dram_T dram_idx,
+  memop_size_T x_size,
+  bool is_unsigned) {
+#pragma HLS INLINE
+
+  // Bus words written for each bus word read, bus words read for each row
+  // and elements in a written bus word
+  const int factor = DST_WIDTH / SRC_WIDTH;
+  const int words = MAT_AXI_RATIO / factor;
+  const int elems = VTA_BUS_WIDTH / DST_WIDTH;
+
+  // The row is assembled in registers and written once, see load_2d
+  DATA_T row[MAT_AXI_RATIO];
+#pragma HLS ARRAY_PARTITION variable = row complete
+  for (int i = 0; i < x_size * words; i++) {
+#pragma HLS PIPELINE II = 1
+    int j = i % words;
+    DATA_T packed = src[dram_idx * words + i];
+    for (int f = 0; f < factor; f++) {
+      DATA_T unpacked = 0;
+      for (int n = 0; n < elems; n++) {
+        ap_uint<SRC_WIDTH> narrow = packed >> ((f * elems + n) * SRC_WIDTH);
+        ap_uint<DST_WIDTH> elem = narrow;
+        if (!is_unsigned) {
+          elem = (ap_int<DST_WIDTH>) (ap_int<SRC_WIDTH>) narrow;
+        }
+        unpacked |= (DATA_T) elem << (n * DST_WIDTH);
+      }
+      row[factor * j + f] = unpacked;
+    }
+    if (j == words - 1) {
+      for (int k = 0; k < MAT_AXI_RATIO; k++) {
+        dst[sram_idx + i / words][k] = row[k];
+      }
+    }
+  }
+}
+
+template <typename DATA_T, int MAT_AXI_RATIO, int ELEM_BYTES, int SRC_WIDTH, int DST_WIDTH>
 void load_pad_2d(
   volatile DATA_T *src,
   DATA_T dst[][MAT_AXI_RATIO],
@@ -54,15 +120,23 @@ void load_pad_2d(
   memop_pad_T x_pad_0,
   memop_pad_T x_pad_1,
   memop_sram_T y_offset_0,
-  memop_sram_T y_offset_1) {
+  memop_sram_T y_offset_1,
+  bool narrow,
+  bool is_unsigned) {
 
   reset_mem<DATA_T, MAT_AXI_RATIO>(sram_idx, y_offset_0, dst);
   for (int y = 0; y < y_size; y++) {
 #pragma HLS LOOP_FLATTEN off
     reset_mem<DATA_T, MAT_AXI_RATIO>(sram_idx, x_pad_0, dst);
-    memcpy(&dst[sram_idx][0],
-           (const DATA_T*) &src[dram_idx * MAT_AXI_RATIO],
-           x_size * ELEM_BYTES);
+    // The DRAM elements are SRC_WIDTH bits wide
+    if (SRC_WIDTH != DST_WIDTH && narrow) {
+      load_extend<DATA_T, MAT_AXI_RATIO, SRC_WIDTH, DST_WIDTH>(
+          src, dst, sram_idx, dram_idx, x_size, is_unsigned);
+    } else {
+      memcpy(&dst[sram_idx][0],
+             (const DATA_T*) &src[dram_idx * MAT_AXI_RATIO],
+             x_size * ELEM_BYTES);
+    }
     sram_idx += x_size;
     dram_idx += x_stride;
     reset_mem<DATA_T, MAT_AXI_RATIO>(sram_idx, x_pad_1, dst);
@@ -78,23 +152,30 @@ void load_2d(
   memop_dram_T dram_idx,
   memop_size_T y_size,
   memop_size_T x_size,
-  memop_stride_T x_stride) {
+  memop_stride_T x_stride,
+  bool int4,
+  bool is_unsigned) {
 
   for (int y = 0; y < y_size; y++) {
 #pragma HLS LOOP_FLATTEN off
-    // The SRAM rows are reshaped into words wider than the bus, so copying one
-    // bus word at a time (like memcpy does) needs a read-modify-write of the
-    // SRAM word and limits the loop to II=2. Instead assemble a whole row in
-    // registers and write it once.
-    DATA_T row[MAT_AXI_RATIO];
+    if (VTA_WGT_INT4_WIDTH != VTA_WGT_WIDTH && int4) {
+      load_extend<DATA_T, MAT_AXI_RATIO, VTA_WGT_INT4_WIDTH, VTA_WGT_WIDTH>(
+          src, dst, sram_idx, dram_idx, x_size, is_unsigned);
+    } else {
+      // The SRAM rows are reshaped into words wider than the bus, so copying
+      // one bus word at a time (like memcpy does) needs a read-modify-write of
+      // the SRAM word and limits the loop to II=2. Instead assemble a whole
+      // row in registers and write it once.
+      DATA_T row[MAT_AXI_RATIO];
 #pragma HLS ARRAY_PARTITION variable = row complete
-    for (int i = 0; i < x_size * MAT_AXI_RATIO; i++) {
+      for (int i = 0; i < x_size * MAT_AXI_RATIO; i++) {
 #pragma HLS PIPELINE II = 1
-      int j = i % MAT_AXI_RATIO;
-      row[j] = src[dram_idx * MAT_AXI_RATIO + i];
-      if (j == MAT_AXI_RATIO - 1) {
-        for (int k = 0; k < MAT_AXI_RATIO; k++) {
-          dst[sram_idx + i / MAT_AXI_RATIO][k] = row[k];
+        int j = i % MAT_AXI_RATIO;
+        row[j] = src[dram_idx * MAT_AXI_RATIO + i];
+        if (j == MAT_AXI_RATIO - 1) {
+          for (int k = 0; k < MAT_AXI_RATIO; k++) {
+            dst[sram_idx + i / MAT_AXI_RATIO][k] = row[k];
+          }
         }
       }
     }
@@ -228,7 +309,7 @@ void load(
   memop_sram_T y_offset_1 = pad_offset(x_width, insn.y_pad_1);
 
   if (insn.memory_type == VTA_MEM_ID_INP) {
-    load_pad_2d<bus_T, INP_MAT_AXI_RATIO, VTA_INP_ELEM_BYTES>(
+    load_pad_2d<bus_T, INP_MAT_AXI_RATIO, VTA_INP_ELEM_BYTES, VTA_INP_INT4_WIDTH, VTA_INP_WIDTH>(
         inputs,
         inp_mem,
         insn.sram_base,
@@ -239,7 +320,9 @@ void load(
         insn.x_pad_0,
         insn.x_pad_1,
         y_offset_0,
-        y_offset_1);
+        y_offset_1,
+        insn.int4,
+        insn.is_unsigned);
   } else if (insn.memory_type == VTA_MEM_ID_WGT) {
     load_2d<bus_T, WGT_MAT_AXI_RATIO, VTA_WGT_ELEM_BYTES>(
         weights,
@@ -248,7 +331,9 @@ void load(
         insn.dram_base,
         insn.y_size,
         insn.x_size,
-        insn.x_stride);
+        insn.x_stride,
+        insn.int4,
+        insn.is_unsigned);
   }
 
   // Push dependence token if instructed
@@ -285,10 +370,12 @@ void gemm(
   bus_T acc_mem[VTA_ACC_BUFF_DEPTH][ACC_MAT_AXI_RATIO],
   bus_T inp_mem[VTA_INP_BUFF_DEPTH][INP_MAT_AXI_RATIO],
   bus_T wgt_mem[VTA_WGT_BUFF_DEPTH][WGT_MAT_AXI_RATIO],
-  bus_T out_mem[VTA_ACC_BUFF_DEPTH][OUT_MAT_AXI_RATIO]) {
+  bus_T out_mem[VTA_ACC_BUFF_DEPTH][OUT_MAT_AXI_RATIO],
+  bool binary) {
 #pragma HLS INLINE
 
   VTAGemInsn insn = *((VTAGemInsn *) &insn_raw);
+  bool inp_unsigned = insn.inp_unsigned;
 
   if (insn.iter_out == 0 || insn.iter_in == 0 || insn.uop_bgn >= insn.uop_end) {
     return;
@@ -333,7 +420,8 @@ void gemm(
     // Output tensor
     out_T o_tensor[VTA_BATCH][VTA_BLOCK_OUT];
 
-    // Binary dot products, used in place of the integer ones when insn.binary
+    // Binary dot products, used in place of the integer ones by
+    // VTA_OPCODE_GEMM_BINARY
     sum_T bin_tensor[VTA_BATCH][VTA_BLOCK_OUT];
     for (int b = 0; b < VTA_BATCH; b++) {
       for (int oc = 0; oc < VTA_BLOCK_OUT; oc++) {
@@ -350,6 +438,19 @@ void gemm(
       }
     }
 
+    // The elements of the input tensor with one more bit, so that they can be
+    // unsigned (inp_unsigned flag of the instruction)
+    ap_int<VTA_INP_WIDTH + 1> i_ext[VTA_BATCH][VTA_BLOCK_IN];
+    for (int b = 0; b < VTA_BATCH; b++) {
+      for (int ic = 0; ic < VTA_BLOCK_IN; ic++) {
+        if (inp_unsigned) {
+          i_ext[b][ic] = (ap_uint<VTA_INP_WIDTH>) i_tensor[b][ic];
+        } else {
+          i_ext[b][ic] = i_tensor[b][ic];
+        }
+      }
+    }
+
     // Inner GEMM loop
 #if VTA_INP_WIDTH == 8 && VTA_WGT_WIDTH == 8 && VTA_BLOCK_OUT % 2 == 0
     // Two products sharing the same input element are computed with a
@@ -357,18 +458,19 @@ void gemm(
     //   (w1 * 2^16 + w0) * i = (w1 * i) * 2^16 + w0 * i
     // w0 * i is in [-16256, 16384] so it is exactly the low 16 bits of the
     // product read as signed, and w1 * i is the rest of the product plus
-    // one when the low part is negative (its sign bit, bit 15).
+    // one when the low part is negative (its sign bit, bit 15). The same holds
+    // with an unsigned i: w0 * i is in [-32640, 32385].
     for (int b = 0; b < VTA_BATCH; b++) {
       for (int oc = 0; oc < VTA_BLOCK_OUT; oc += 2) {
         sum_T tmp[2] = {0, 0};
         for (int ic = 0; ic < VTA_BLOCK_IN; ic++) {
           ap_int<25> w_packed = ((ap_int<25>) w_tensor[oc + 1][ic] << 16) + w_tensor[oc][ic];
-          ap_int<33> prod_dsp = w_packed * i_tensor[b][ic];
+          ap_int<34> prod_dsp = w_packed * i_ext[b][ic];
           tmp[0] += (ap_int<16>) prod_dsp;
-          tmp[1] += (ap_int<17>) (prod_dsp >> 16) + (ap_uint<1>) prod_dsp[15];
+          tmp[1] += (ap_int<18>) (prod_dsp >> 16) + (ap_uint<1>) prod_dsp[15];
         }
         for (int k = 0; k < 2; k++) {
-          sum_T dot = insn.binary ? bin_tensor[b][oc + k] : tmp[k];
+          sum_T dot = binary ? bin_tensor[b][oc + k] : tmp[k];
           acc_T accum = a_tensor[b][oc + k] + (acc_T) dot;
           a_tensor[b][oc + k] = insn.reset_reg ? (acc_T) 0 : accum;
           o_tensor[b][oc + k] = (out_T) accum.range(VTA_OUT_WIDTH - 1, 0);
@@ -385,11 +487,11 @@ void gemm(
         // Inner matrix multiplication loop (input channel/feature)
         for (int ic = 0; ic < VTA_BLOCK_IN; ic++) {
           wgt_T w_elem = w_tensor[oc][ic];
-          inp_T i_elem = i_tensor[b][ic];
+          ap_int<VTA_INP_WIDTH + 1> i_elem = i_ext[b][ic];
           mul_T prod_dsp = i_elem * w_elem;
           tmp += (sum_T) prod_dsp;
         }
-        if (insn.binary) {
+        if (binary) {
           tmp = bin_tensor[b][oc];
         }
         // Update summation
@@ -436,8 +538,6 @@ void alu(
   insn_T insn_raw,
   uop_T uop_mem[VTA_UOP_BUFF_DEPTH],
   bus_T acc_mem[VTA_ACC_BUFF_DEPTH][ACC_MAT_AXI_RATIO],
-  bus_T inp_mem[VTA_INP_BUFF_DEPTH][INP_MAT_AXI_RATIO],
-  bus_T wgt_mem[VTA_WGT_BUFF_DEPTH][WGT_MAT_AXI_RATIO],
   bus_T out_mem[VTA_ACC_BUFF_DEPTH][OUT_MAT_AXI_RATIO]) {
 #pragma HLS INLINE
 
@@ -450,6 +550,15 @@ void alu(
   // Loop offsets
   acc_idx_T dst_offset_out = 0, dst_offset_in = 0;
   inp_idx_T src_offset_out = 0, src_offset_in = 0;
+
+  bool pack_int4 = insn.alu_opcode == VTA_ALU_OPCODE_PACK_INT4;
+
+  // Requantization arguments, packed in the immediate
+  ap_uint<VTA_ALUOP_IMM_BIT_WIDTH> requant_imm = insn.imm;
+  ap_uint<VTA_REQUANT_SHIFT_BIT_WIDTH> requant_shift = requant_imm.range(VTA_REQUANT_SHIFT_BIT_WIDTH - 1, 0);
+  bool requant_round = requant_imm[VTA_REQUANT_ROUND_BIT];
+  bool requant_even = requant_imm[VTA_REQUANT_EVEN_BIT];
+  ap_uint<2 * VTA_ACC_WIDTH> requant_mask = ((ap_uint<2 * VTA_ACC_WIDTH>) 1 << requant_shift) - 1;
 
   // Single loop instead of three nested ones, see gemm()
   uop_idx_T upc = insn.uop_bgn;
@@ -474,7 +583,9 @@ void alu(
     read_tensor<bus_T, acc_T, acc_idx_T, VTA_BUS_WIDTH, VTA_ACC_WIDTH, VTA_BATCH, VTA_BLOCK_OUT>(src_idx, acc_mem, src_tensor);
     // Read in dst tensor
     acc_T dst_tensor[VTA_BATCH][VTA_BLOCK_OUT];
-    read_tensor<bus_T, acc_T, acc_idx_T, VTA_BUS_WIDTH, VTA_ACC_WIDTH, VTA_BATCH, VTA_BLOCK_OUT>(dst_idx, acc_mem, dst_tensor);
+    // The int4 packing takes its second operand from the tensor after src
+    acc_idx_T dst_read_idx = pack_int4 ? (acc_idx_T) (src_idx + 1) : dst_idx;
+    read_tensor<bus_T, acc_T, acc_idx_T, VTA_BUS_WIDTH, VTA_ACC_WIDTH, VTA_BATCH, VTA_BLOCK_OUT>(dst_read_idx, acc_mem, dst_tensor);
     // Output tensor
     out_T o_tensor[VTA_BATCH][VTA_BLOCK_OUT];
 
@@ -486,6 +597,10 @@ void alu(
         acc_T src_1 = insn.use_imm ? (acc_T) insn.imm : src_tensor[i][b];
         aluop_shr_arg_T shft_by = src_1.range(VTA_SHR_ARG_BIT_WIDTH - 1, 0);
         aluop_mul_arg_T mul_by = src_1.range(VTA_MUL_ARG_BIT_WIDTH - 1, 0);
+        // The multiplier is shared between the multiplication and the
+        // requantization, the latter always takes the tensor as second operand
+        acc_T mul_arg = insn.alu_opcode == VTA_ALU_OPCODE_REQUANT ? src_tensor[i][b] : (acc_T) mul_by;
+        ap_int<2 * VTA_ACC_WIDTH> prod = src_0 * mul_arg;
         if (insn.alu_opcode == VTA_ALU_OPCODE_MIN || insn.alu_opcode == VTA_ALU_OPCODE_MAX) {
           // Compute Min/Max
           acc_T mix_val = src_0 < src_1 ?
@@ -506,9 +621,23 @@ void alu(
           o_tensor[i][b] = (out_T) shr_val.range(VTA_OUT_WIDTH - 1, 0);
         } else if (insn.alu_opcode == VTA_ALU_OPCODE_MUL) {
           // Compute Multiply
-          acc_T mul_val = src_0 * mul_by;
+          acc_T mul_val = prod;
           dst_tensor[i][b] = mul_val;
           o_tensor[i][b] = (out_T) mul_val.range(VTA_OUT_WIDTH - 1, 0);
+        } else if (insn.alu_opcode == VTA_ALU_OPCODE_REQUANT) {
+          // Compute the fixed point multiplication with a single rounding
+          ap_int<2 * VTA_ACC_WIDTH + 1> half = 0;
+          if (requant_round && requant_shift != 0) {
+            half = (ap_int<2 * VTA_ACC_WIDTH + 1>) 1 << (requant_shift - 1);
+          }
+          acc_T requant_val = (prod + half) >> requant_shift;
+          // The discarded bits are exactly one half, round to even instead of up
+          ap_uint<2 * VTA_ACC_WIDTH> discarded = (ap_uint<2 * VTA_ACC_WIDTH>) prod & requant_mask;
+          if (requant_even && half != 0 && discarded == half) {
+            requant_val[0] = 0;
+          }
+          dst_tensor[i][b] = requant_val;
+          o_tensor[i][b] = (out_T) requant_val.range(VTA_OUT_WIDTH - 1, 0);
         } else if (insn.alu_opcode == VTA_ALU_OPCODE_PACK_SIGN) {
           // Compute Shift in the sign bit
           acc_T pack_val = (src_0 << 1) | (acc_T) (src_1 >= 0);
@@ -518,8 +647,27 @@ void alu(
       }
     }
 
-    // Write the results back into accumulator
-    write_tensor<bus_T, acc_T, acc_idx_T, VTA_BUS_WIDTH, VTA_ACC_WIDTH, VTA_BATCH, VTA_BLOCK_OUT>(dst_idx, dst_tensor, acc_mem);
+#if VTA_OUT_WIDTH == 8 && VTA_BLOCK_OUT % 2 == 0
+    // Pack the low 4 bits of the elements of the tensors src and src + 1 in
+    // the output tensor, the low nibble of a byte is the first element
+    if (pack_int4) {
+      for (int i = 0; i < VTA_BATCH; i++) {
+        for (int b = 0; b < VTA_BLOCK_OUT; b++) {
+          int lane = 2 * (b % (VTA_BLOCK_OUT / 2));
+          bool second = b >= VTA_BLOCK_OUT / 2;
+          ap_uint<4> lo = second ? dst_tensor[i][lane] : src_tensor[i][lane];
+          ap_uint<4> hi = second ? dst_tensor[i][lane + 1] : src_tensor[i][lane + 1];
+          o_tensor[i][b] = (out_T) (((ap_uint<8>) hi << 4) | lo);
+        }
+      }
+    }
+#endif
+
+    // Write the results back into accumulator, the int4 packing only writes
+    // the output buffer
+    if (!pack_int4) {
+      write_tensor<bus_T, acc_T, acc_idx_T, VTA_BUS_WIDTH, VTA_ACC_WIDTH, VTA_BATCH, VTA_BLOCK_OUT>(dst_idx, dst_tensor, acc_mem);
+    }
     // Write the results back in the output buffer
     write_tensor<bus_T, out_T, acc_idx_T, VTA_BUS_WIDTH, VTA_OUT_WIDTH, VTA_BATCH, VTA_BLOCK_OUT>(dst_idx, o_tensor, out_mem);
 
@@ -620,9 +768,11 @@ PRAGMA_HLS(HLS INTERFACE s_axilite port = done bundle = CONTROL_BUS offset = VTA
       memcpy(&uop_mem[sram_idx],
              (const uop_T*) &uops[dram_idx],
              insn.mem.x_size * sizeof(uop_T));
-    } else if (insn.mem.memory_type == VTA_MEM_ID_ACC) {
-      // Perform data transfer from DRAM
-      load_pad_2d<bus_T, ACC_MAT_AXI_RATIO, VTA_ACC_ELEM_BYTES>(
+    } else if (insn.mem.memory_type == VTA_MEM_ID_ACC ||
+               insn.mem.memory_type == VTA_MEM_ID_ACC_8BIT) {
+      // Perform data transfer from DRAM, the 8 bit elements (VTA_MEM_ID_ACC_8BIT)
+      // are sign extended or zero extended (is_unsigned flag of the instruction)
+      load_pad_2d<bus_T, ACC_MAT_AXI_RATIO, VTA_ACC_ELEM_BYTES, VTA_ACC8_WIDTH, VTA_ACC_WIDTH>(
           biases,
           acc_mem,
           sram_idx,
@@ -633,12 +783,16 @@ PRAGMA_HLS(HLS INTERFACE s_axilite port = done bundle = CONTROL_BUS offset = VTA
           insn.mem.x_pad_0,
           insn.mem.x_pad_1,
           y_offset_0,
-          y_offset_1);
+          y_offset_1,
+          insn.mem.memory_type == VTA_MEM_ID_ACC_8BIT,
+          insn.mem.is_unsigned);
     }
-  } else if (insn.generic.opcode == VTA_OPCODE_GEMM) {
-    gemm(raw_copy, uop_mem, acc_mem, inp_mem, wgt_mem, out_mem);
+  } else if (insn.generic.opcode == VTA_OPCODE_GEMM ||
+             insn.generic.opcode == VTA_OPCODE_GEMM_BINARY) {
+    gemm(raw_copy, uop_mem, acc_mem, inp_mem, wgt_mem, out_mem,
+         insn.generic.opcode == VTA_OPCODE_GEMM_BINARY);
   } else if (insn.generic.opcode == VTA_OPCODE_ALU) {
-    alu(raw_copy, uop_mem, acc_mem, inp_mem, wgt_mem, out_mem);
+    alu(raw_copy, uop_mem, acc_mem, out_mem);
   }
 
   // Push dependence token if instructed

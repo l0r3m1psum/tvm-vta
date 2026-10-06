@@ -161,8 +161,12 @@ class SRAM {
     load_counter[0] += (op->x_size * op->y_size) * kElemBytes;
     if (skip_exec) return;
     DType* sram_ptr = data_ + op->sram_base;
+    // The DRAM holds packed 4 bit elements that are extended to 8 bits, only
+    // for the memories with 8 bit elements (input and weight)
+    bool int4 = op->int4 && kBits == 8;
+    int dram_elem_bytes = int4 ? kElemBytes / 2 : kElemBytes;
     uint8_t* dram_ptr = static_cast<uint8_t*>(dram->GetAddr(
-        op->dram_base * kElemBytes));
+        op->dram_base * dram_elem_bytes));
     uint64_t xtotal = op->x_size + op->x_pad_0 + op->x_pad_1;
     uint32_t ytotal = op->y_size + op->y_pad_0 + op->y_pad_1;
     uint64_t sram_end = op->sram_base + xtotal * ytotal;
@@ -173,20 +177,33 @@ class SRAM {
     for (uint32_t y = 0; y < op->y_size; ++y) {
       memset(sram_ptr, 0, kElemBytes * op->x_pad_0);
       sram_ptr += op->x_pad_0;
-      memcpy(sram_ptr, dram_ptr, kElemBytes * op->x_size);
+      if (int4) {
+        // The low nibble of a byte is the first element
+        uint8_t* sram_bytes = reinterpret_cast<uint8_t*>(sram_ptr);
+        for (uint64_t i = 0; i < static_cast<uint64_t>(kElemBytes) * op->x_size; ++i) {
+          uint8_t nibble = (dram_ptr[i / 2] >> (4 * (i % 2))) & 0xF;
+          if (!op->is_unsigned && (nibble & 0x8)) {
+            nibble |= 0xF0;
+          }
+          sram_bytes[i] = nibble;
+        }
+      } else {
+        memcpy(sram_ptr, dram_ptr, kElemBytes * op->x_size);
+      }
       sram_ptr += op->x_size;
       memset(sram_ptr, 0, kElemBytes * op->x_pad_1);
       sram_ptr += op->x_pad_1;
-      dram_ptr += kElemBytes * op->x_stride;
+      dram_ptr += dram_elem_bytes * op->x_stride;
     }
     memset(sram_ptr, 0, kElemBytes * xtotal * op->y_pad_1);
   }
 
-  // This is for load 8bits to ACC only
+  // This is for load 8bits to ACC only, sign or zero extended
   void Load_int8(const VTAMemInsn* op,
             DRAM* dram,
             uint64_t* load_counter,
-            bool skip_exec) {
+            bool skip_exec,
+            bool is_unsigned) {
     CHECK_EQ(kBits, VTA_ACC_WIDTH);
 
     // TODO(zhanghao): extend to other width
@@ -212,7 +229,11 @@ class SRAM {
 
       int32_t* sram_ele_ptr = (int32_t*)sram_ptr;
       for (uint32_t x = 0; x < op->x_size * VTA_BATCH * VTA_BLOCK_OUT; ++x) {
-        *(sram_ele_ptr + x) = (int32_t)*(dram_ptr + x);
+        if (is_unsigned) {
+          *(sram_ele_ptr + x) = (int32_t)(uint8_t)*(dram_ptr + x);
+        } else {
+          *(sram_ele_ptr + x) = (int32_t)*(dram_ptr + x);
+        }
       }
       sram_ptr += op->x_size;
 
@@ -345,7 +366,8 @@ class Device {
     switch (mem->opcode) {
       case VTA_OPCODE_LOAD: device->RunLoad(mem); break;
       case VTA_OPCODE_STORE: device->RunStore(mem); break;
-      case VTA_OPCODE_GEMM: device->RunGEMM(gem); break;
+      case VTA_OPCODE_GEMM: device->RunGEMM(gem, false); break;
+      case VTA_OPCODE_GEMM_BINARY: device->RunGEMM(gem, true); break;
       case VTA_OPCODE_ALU: device->RunALU(alu); break;
       case VTA_OPCODE_FINISH: ++(device->finish_counter_); break;
       default: {
@@ -376,7 +398,8 @@ class Device {
       // subsequent non-debug mode exec can depend on it.
       uop_.Load(op, dram_, &(prof_->uop_load_nbytes), false);
     } else if (op->memory_type == VTA_MEM_ID_ACC_8BIT) {
-      acc_.Load_int8(op, dram_, &(prof_->acc_load_nbytes), prof_->SkipExec());
+      acc_.Load_int8(op, dram_, &(prof_->acc_load_nbytes), prof_->SkipExec(),
+                     op->is_unsigned);
     } else {
       LOG(FATAL) << "Unknown memory_type=" << op->memory_type;
     }
@@ -396,7 +419,8 @@ class Device {
     }
   }
 
-  void RunGEMM(const VTAGemInsn* op) {
+  // With binary the elements are packed bits (VTA_OPCODE_GEMM_BINARY)
+  void RunGEMM(const VTAGemInsn* op, bool binary) {
     if (!op->reset_reg) {
       prof_->gemm_counter += op->iter_out * op->iter_in * (op->uop_end - op->uop_bgn);
       if (prof_->SkipExec()) return;
@@ -423,8 +447,11 @@ class Device {
                 int32_t sum = acc.GetSigned(acc_offset);
                 for (uint32_t k = 0; k < VTA_BLOCK_IN; ++k) {
                   int32_t inp_elem = inp.GetSigned(i * VTA_BLOCK_IN + k);
+                  if (op->inp_unsigned) {
+                    inp_elem &= (1 << VTA_INP_WIDTH) - 1;
+                  }
                   int32_t wgt_elem = wgt.GetSigned(j * VTA_BLOCK_IN + k);
-                  if (op->binary) {
+                  if (binary) {
                     // The elements are packed bits (1 is +1, 0 is -1), their
                     // dot product is bits - 2 * popcount(input xor weight)
                     CHECK_EQ(VTA_INP_WIDTH, VTA_WGT_WIDTH);
@@ -465,7 +492,9 @@ class Device {
   }
 
   void RunALU(const VTAAluInsn* op) {
-    if (op->use_imm) {
+    // The requantization always takes the multiplier from the tensor, the
+    // immediate holds its other arguments
+    if (op->use_imm && op->alu_opcode != VTA_ALU_OPCODE_REQUANT) {
       RunALU_<true>(op);
     } else {
       RunALU_<false>(op);
@@ -504,6 +533,27 @@ class Device {
             return x * y;
           });
       }
+      case VTA_ALU_OPCODE_REQUANT: {
+        // MultiplyByQuantizedMultiplier of TFLite with TFLITE_SINGLE_ROUNDING,
+        // optionally truncating or rounding the ties to even (HAWQ-V3)
+        uint32_t imm = static_cast<uint32_t>(op->imm);
+        int shift = imm & ((1 << VTA_REQUANT_SHIFT_BIT_WIDTH) - 1);
+        bool round = (imm >> VTA_REQUANT_ROUND_BIT) & 1;
+        bool even = (imm >> VTA_REQUANT_EVEN_BIT) & 1;
+        return RunALULoop<false>(op, [shift, round, even](int32_t x, int32_t y) {
+            int64_t prod = static_cast<int64_t>(x) * static_cast<int64_t>(y);
+            int64_t half = (round && shift != 0) ? static_cast<int64_t>(1) << (shift - 1) : 0;
+            int64_t result = (prod + half) >> shift;
+            int64_t discarded = prod & ((static_cast<int64_t>(1) << shift) - 1);
+            if (even && half != 0 && discarded == half) {
+              result &= ~static_cast<int64_t>(1);
+            }
+            return static_cast<int32_t>(result);
+          });
+      }
+      case VTA_ALU_OPCODE_PACK_INT4: {
+        return RunALUPackInt4(op);
+      }
       case VTA_ALU_OPCODE_PACK_SIGN: {
         // Shift left by one and shift in 1 if the source is >= 0
         return RunALULoop<use_imm>(op, [](int32_t x, int32_t y) {
@@ -513,6 +563,42 @@ class Device {
       }
       default: {
         LOG(FATAL) << "Unknown ALU code " << op->alu_opcode;
+      }
+    }
+  }
+
+  // Packs the low 4 bits of the elements of the tensors src and src + 1, the
+  // low nibble of a byte is the first element. The hardware only writes the
+  // output memory, this simulator has no output memory (the store truncates
+  // the accumulator) so here the packed bytes are written in the tensor dst.
+  void RunALUPackInt4(const VTAAluInsn* op) {
+    prof_->alu_counter += op->iter_out * op->iter_in * (op->uop_end - op->uop_bgn);
+    if (prof_->SkipExec()) return;
+    for (int y = 0; y < op->iter_out; ++y) {
+      for (int x = 0; x < op->iter_in; ++x) {
+        for (int k = op->uop_bgn; k < op->uop_end; ++k) {
+          VTAUop* uop_ptr = static_cast<VTAUop*>(uop_.BeginPtr(k));
+          uint32_t dst_index = uop_ptr->dst_idx;
+          uint32_t src_index = uop_ptr->src_idx;
+          dst_index += y * op->dst_factor_out + x * op->dst_factor_in;
+          src_index += y * op->src_factor_out + x * op->src_factor_in;
+          BitPacker<VTA_ACC_WIDTH> dst(acc_.BeginPtr(dst_index));
+          BitPacker<VTA_ACC_WIDTH> src0(acc_.BeginPtr(src_index));
+          BitPacker<VTA_ACC_WIDTH> src1(acc_.BeginPtr(src_index + 1));
+          int32_t packed[VTA_BATCH * VTA_BLOCK_OUT];
+          for (int i = 0; i < VTA_BATCH; ++i) {
+            for (int b = 0; b < VTA_BLOCK_OUT; ++b) {
+              int lane = i * VTA_BLOCK_OUT + 2 * (b % (VTA_BLOCK_OUT / 2));
+              bool second = b >= VTA_BLOCK_OUT / 2;
+              int32_t lo = (second ? src1.GetSigned(lane) : src0.GetSigned(lane)) & 0xF;
+              int32_t hi = (second ? src1.GetSigned(lane + 1) : src0.GetSigned(lane + 1)) & 0xF;
+              packed[i * VTA_BLOCK_OUT + b] = static_cast<int8_t>((hi << 4) | lo);
+            }
+          }
+          for (int n = 0; n < VTA_BATCH * VTA_BLOCK_OUT; ++n) {
+            dst.SetSigned(n, packed[n]);
+          }
+        }
       }
     }
   }

@@ -48,6 +48,7 @@ CORE_TYPE TlppVerify::GetCoreType(uint64_t operation_code,
   const VTAMemInsn* mem = reinterpret_cast<const VTAMemInsn*>(insn);
   switch (operation_code) {
     case VTA_OPCODE_GEMM:
+    case VTA_OPCODE_GEMM_BINARY:
     case VTA_OPCODE_ALU:
       core_type = COREGEMM;
       break;

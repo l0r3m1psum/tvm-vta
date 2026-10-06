@@ -145,6 +145,10 @@ const char* getOpcodeString(int opcode, bool use_imm) {
     return "mul";
   } else if (opcode == VTA_ALU_OPCODE_PACK_SIGN) {
     return "pack sign";
+  } else if (opcode == VTA_ALU_OPCODE_REQUANT) {
+    return "requant";
+  } else if (opcode == VTA_ALU_OPCODE_PACK_INT4) {
+    return "pack int4";
   }
   return "unknown op";
 }
@@ -285,7 +289,7 @@ void freeBuffer(void * buffer) {
 
 VTAGenericInsn get2DLoadStoreInsn(int opcode, int type, int sram_offset, int dram_offset,
     int y_size, int x_size, int x_stride, int y_pad, int x_pad, int pop_prev_dep, int pop_next_dep,
-    int push_prev_dep, int push_next_dep) {
+    int push_prev_dep, int push_next_dep, bool int4, bool is_unsigned) {
   // Converter
   union VTAInsn converter;
   // Memory instruction initialization
@@ -298,6 +302,8 @@ VTAGenericInsn get2DLoadStoreInsn(int opcode, int type, int sram_offset, int dra
   insn.memory_type = type;
   insn.sram_base = sram_offset;
   insn.dram_base = dram_offset;
+  insn.int4 = int4;
+  insn.is_unsigned = is_unsigned;
   insn.y_size = y_size;
   insn.x_size = x_size;
   insn.x_stride = x_stride;
@@ -310,7 +316,8 @@ VTAGenericInsn get2DLoadStoreInsn(int opcode, int type, int sram_offset, int dra
 }
 
 VTAGenericInsn get1DLoadStoreInsn(int opcode, int type, int sram_offset, int dram_offset, int size,
-    int pop_prev_dep, int pop_next_dep, int push_prev_dep, int push_next_dep) {
+    int pop_prev_dep, int pop_next_dep, int push_prev_dep, int push_next_dep, bool int4,
+    bool is_unsigned) {
   // Converter
   union VTAInsn converter;
   // Memory instruction initialization
@@ -323,6 +330,8 @@ VTAGenericInsn get1DLoadStoreInsn(int opcode, int type, int sram_offset, int dra
   insn.memory_type = type;
   insn.sram_base = sram_offset;
   insn.dram_base = dram_offset;
+  insn.int4 = int4;
+  insn.is_unsigned = is_unsigned;
   insn.y_size = 1;
   insn.x_size = size;
   insn.x_stride = size;
@@ -336,18 +345,18 @@ VTAGenericInsn get1DLoadStoreInsn(int opcode, int type, int sram_offset, int dra
 
 VTAGenericInsn getGEMMInsn(int uop_offset, int batch, int in_feat, int out_feat,
     bool uop_compression, int pop_prev_dep, int pop_next_dep, int push_prev_dep,
-    int push_next_dep, bool binary) {
+    int push_next_dep, bool binary, bool inp_unsigned) {
   // Converter
   union VTAInsn converter;
   // GEMM instruction initialization
   VTAGemInsn insn;
-  insn.opcode = VTA_OPCODE_GEMM;
+  insn.opcode = binary ? VTA_OPCODE_GEMM_BINARY : VTA_OPCODE_GEMM;
   insn.pop_prev_dep = pop_prev_dep;
   insn.pop_next_dep = pop_next_dep;
   insn.push_prev_dep = push_prev_dep;
   insn.push_next_dep = push_next_dep;
   insn.reset_reg = false;
-  insn.binary = binary;
+  insn.inp_unsigned = inp_unsigned;
   if (!uop_compression) {
     insn.uop_bgn = uop_offset;
     insn.uop_end = uop_offset + batch * in_feat * out_feat;
@@ -633,7 +642,7 @@ void printInstruction(int num_insn, VTAGenericInsn *insns) {
         if (c.mem.pop_next_dep) s2g_queue--;
         if (c.mem.push_next_dep) g2s_queue++;
       }
-    } else if (c.mem.opcode == VTA_OPCODE_GEMM) {
+    } else if (c.mem.opcode == VTA_OPCODE_GEMM || c.mem.opcode == VTA_OPCODE_GEMM_BINARY) {
       // Print instruction field information
       printf("GEMM\n");
       printf("\tdep - pop prev: %d, pop next: %d, push prev: %d, push next: %d\n",
@@ -727,6 +736,12 @@ int alu_test(int opcode, bool use_imm, int batch, int vector_size, bool uop_comp
   int tx_size = vector_size / VTA_BLOCK_OUT;
   // Number of input sets to be generated
   int input_sets = (use_imm) ? 1 : 2;
+  // The int4 packing reads the tensors src and src + 1, an extra input set
+  // makes the one after the last source tensor defined
+  if (opcode == VTA_ALU_OPCODE_PACK_INT4) {
+    assert(!use_imm);
+    input_sets = 3;
+  }
   // Make sure we don't exceed buffer bounds
   assert(uop_size <= VTA_UOP_BUFF_DEPTH);
   assert(tx_size * input_sets <= VTA_ACC_BUFF_DEPTH);
@@ -746,9 +761,21 @@ int alu_test(int opcode, bool use_imm, int batch, int vector_size, bool uop_comp
     } else if (opcode == VTA_ALU_OPCODE_SHR) {
       immediate[b] = static_cast<acc_T>(
           rand_r(&globalSeed) % (1LL << (VTA_SHR_ARG_BIT_WIDTH - 1)) - (1LL << (VTA_SHR_ARG_BIT_WIDTH - 2)));
+    } else if (opcode == VTA_ALU_OPCODE_PACK_INT4) {
+      immediate[b] = 0;
     } else if (opcode == VTA_ALU_OPCODE_MUL || opcode == VTA_ALU_OPCODE_PACK_SIGN) {
       immediate[b] = static_cast<acc_T>(
           rand_r(&globalSeed) % (1LL << (VTA_MUL_ARG_BIT_WIDTH - 1)) - (1LL << (VTA_MUL_ARG_BIT_WIDTH - 2)));
+    } else if (opcode == VTA_ALU_OPCODE_REQUANT) {
+      // The multiplier is always a tensor, the immediate holds the shift and
+      // the rounding mode: truncate, round half up or round half to even
+      assert(!use_imm);
+      int shift = 1 + rand_r(&globalSeed) % ((1 << VTA_REQUANT_SHIFT_BIT_WIDTH) - 2);
+      int mode = b % 3;
+      immediate[b] = static_cast<acc_T>(
+          shift |
+          (mode >= 1 ? 1 << VTA_REQUANT_ROUND_BIT : 0) |
+          (mode == 2 ? 1 << VTA_REQUANT_EVEN_BIT : 0));
     }
   }
 
@@ -824,9 +851,28 @@ int alu_test(int opcode, bool use_imm, int batch, int vector_size, bool uop_comp
       } else if (opcode == VTA_ALU_OPCODE_SHR) {
         inputs[i][j] = static_cast<acc_T>(
             rand_r(&globalSeed) % (1LL << (VTA_SHR_ARG_BIT_WIDTH - 1)) - (1LL << (VTA_SHR_ARG_BIT_WIDTH - 2)));
-      } else if (opcode == VTA_ALU_OPCODE_MUL || opcode == VTA_ALU_OPCODE_PACK_SIGN) {
+      } else if (opcode == VTA_ALU_OPCODE_MUL || opcode == VTA_ALU_OPCODE_PACK_SIGN ||
+                 opcode == VTA_ALU_OPCODE_PACK_INT4) {
         inputs[i][j] = static_cast<acc_T>(
             rand_r(&globalSeed) % (1LL << (VTA_MUL_ARG_BIT_WIDTH - 1)) - (1LL << (VTA_MUL_ARG_BIT_WIDTH - 2)));
+      } else if (opcode == VTA_ALU_OPCODE_REQUANT) {
+        // 32 random bits, rand() can be as short as 15 bits
+        uint32_t bits =
+            (static_cast<uint32_t>(rand_r(&globalSeed)) << 17) ^
+            (static_cast<uint32_t>(rand_r(&globalSeed)) << 6) ^
+            static_cast<uint32_t>(rand_r(&globalSeed));
+        int shift = static_cast<int>(immediate[i / VTA_BATCH]) & ((1 << VTA_REQUANT_SHIFT_BIT_WIDTH) - 1);
+        if (j < vector_size) {
+          // Value to requantize
+          inputs[i][j] = static_cast<acc_T>(static_cast<int32_t>(bits));
+        } else if (j % 2 == 0 && shift <= 31) {
+          // Multiplier that makes the odd values exact ties, random
+          // multipliers almost never produce them
+          inputs[i][j] = static_cast<acc_T>(static_cast<int32_t>(1u << (shift - 1)));
+        } else {
+          // Non negative multiplier
+          inputs[i][j] = static_cast<acc_T>(static_cast<int32_t>(bits & 0x7FFFFFFF));
+        }
       }
     }
   }
@@ -877,6 +923,33 @@ int alu_test(int opcode, bool use_imm, int batch, int vector_size, bool uop_comp
       } else if (opcode == VTA_ALU_OPCODE_PACK_SIGN) {
         // Shift in 1 if the source is >= 0 and 0 otherwise
         out_val = inputs[i][j] * 2 + (src_val >= 0 ? 1 : 0);
+      } else if (opcode == VTA_ALU_OPCODE_REQUANT) {
+        // MultiplyByQuantizedMultiplier of TFLite with TFLITE_SINGLE_ROUNDING,
+        // where total_shift is the shift in the immediate
+        int imm = static_cast<int>(imm_val);
+        int shift = imm & ((1 << VTA_REQUANT_SHIFT_BIT_WIDTH) - 1);
+        bool round = (imm >> VTA_REQUANT_ROUND_BIT) & 1;
+        bool even = (imm >> VTA_REQUANT_EVEN_BIT) & 1;
+        int64_t prod =
+            static_cast<int64_t>(static_cast<int>(inputs[i][j])) *
+            static_cast<int64_t>(static_cast<int>(inputs[i][j + vector_size]));
+        int64_t half = round ? static_cast<int64_t>(1) << (shift - 1) : 0;
+        int64_t result = (prod + half) >> shift;
+        // torch.round of HAWQ-V3 rounds the ties to even
+        if (even && round && (prod & ((static_cast<int64_t>(1) << shift) - 1)) == half) {
+          result &= ~static_cast<int64_t>(1);
+        }
+        out_val = static_cast<acc_T>(static_cast<int32_t>(result));
+      } else if (opcode == VTA_ALU_OPCODE_PACK_INT4) {
+        // The output tensor packs the low 4 bits of the elements of the source
+        // tensor (first half of the bytes) and of the one after it (second
+        // half), the low nibble of a byte is the first element
+        int tensor = j / VTA_BLOCK_OUT + (j % VTA_BLOCK_OUT >= VTA_BLOCK_OUT / 2 ? 1 : 0);
+        int elem = 2 * (j % (VTA_BLOCK_OUT / 2));
+        int base = vector_size + tensor * VTA_BLOCK_OUT + elem;
+        int lo = static_cast<int>(inputs[i][base]) & 0xF;
+        int hi = static_cast<int>(inputs[i][base + 1]) & 0xF;
+        out_val = static_cast<acc_T>(static_cast<int8_t>((hi << 4) | lo));
       }
       outputs_ref[i][j] = (out_T) out_val;
     }
@@ -1234,15 +1307,15 @@ int blocked_gemm_test(int batch, int channels, int block, bool uop_compression,
 
 
 int gemm_test(int batch, int in_channels, int out_channels, bool uop_compression,
-              bool binary) {
+              bool binary, int int4, bool inp_unsigned) {
   // Some assertions
   assert(batch % VTA_BATCH == 0);
   assert(in_channels % VTA_BLOCK_IN == 0);
   assert(out_channels % VTA_BLOCK_OUT == 0);
 
   printf("=====================================================================================\n");
-  printf("INFO - Blocked GEMM test: batch=%d, in_channels=%d, out_channels=%d, uop_comp=%d, binary=%d\n",
-         batch, in_channels, out_channels, uop_compression, binary);
+  printf("INFO - Blocked GEMM test: batch=%d, in_channels=%d, out_channels=%d, uop_comp=%d, binary=%d, int4=%d, inp_unsigned=%d\n",
+         batch, in_channels, out_channels, uop_compression, binary, int4, inp_unsigned);
 
   // Derive number of elements that need to be loaded/stored
   int ins_size = 7;
@@ -1295,7 +1368,9 @@ int gemm_test(int batch, int in_channels, int out_channels, bool uop_compression
       0,                                                  // pop prev dep
       1,                                                  // pop next dep
       0,                                                  // push prev dep
-      0);                                                 // push next dep
+      0,                                                  // push next dep
+      int4 != 0,                                          // int4
+      false);                                             // int4 unsigned
   // Load input block (push next)
   insn_buf[insn_idx++] = get1DLoadStoreInsn(
       VTA_OPCODE_LOAD,                                    // opcode
@@ -1306,7 +1381,9 @@ int gemm_test(int batch, int in_channels, int out_channels, bool uop_compression
       0,                                                  // pop prev dep
       0,                                                  // pop next dep
       0,                                                  // push prev dep
-      1);                                                 // push next dep
+      1,                                                  // push next dep
+      int4 != 0,                                          // int4
+      int4 == 2);                                         // int4 unsigned
   // Perform GEMM (pop prev, push prev if not last, push next if last)
   insn_buf[insn_idx++] = getGEMMInsn(
       0,                                                  // uop offset
@@ -1318,7 +1395,8 @@ int gemm_test(int batch, int in_channels, int out_channels, bool uop_compression
       0,                                                  // pop_next_dep
       0,                                                  // push prev dep
       1,                                                  // push_next_dep
-      binary);                                            // binary
+      binary,                                             // binary
+      inp_unsigned);                                      // inp_unsigned
   // Store output block (pop prev, push prev if not last)
   insn_buf[insn_idx++] = get1DLoadStoreInsn(
       VTA_OPCODE_STORE,                                   // opcode
@@ -1352,6 +1430,22 @@ int gemm_test(int batch, int in_channels, int out_channels, bool uop_compression
   wgt_T **weights = allocInit2dArray<wgt_T>(out_channels, in_channels);
   // Initialize biases
   acc_T **biases = allocInit2dArray<acc_T>(batch, out_channels);
+  // The DRAM holds packed 4 bit elements, keep the values in their range:
+  // the weights are signed, the inputs are unsigned when int4 is 2
+  if (int4) {
+    for (int i = 0; i < batch; i++) {
+      for (int k = 0; k < in_channels; k++) {
+        int nibble = static_cast<int>(inputs[i][k]) & 0xF;
+        inputs[i][k] = static_cast<inp_T>(int4 == 2 ? nibble : (nibble ^ 8) - 8);
+      }
+    }
+    for (int j = 0; j < out_channels; j++) {
+      for (int k = 0; k < in_channels; k++) {
+        int nibble = static_cast<int>(weights[j][k]) & 0xF;
+        weights[j][k] = static_cast<wgt_T>((nibble ^ 8) - 8);
+      }
+    }
+  }
 
   // Reference GEMM implementation
   out_T **outputs_ref = alloc2dArray<out_T>(batch, out_channels);
@@ -1369,6 +1463,10 @@ int gemm_test(int batch, int in_channels, int out_channels, bool uop_compression
             different += (diff >> bit) & 1;
           }
           sum += (acc_T) (VTA_INP_WIDTH - 2 * different);
+        } else if (inp_unsigned) {
+          // The bits of the inputs are read as unsigned (inp_unsigned flag)
+          int input = static_cast<int>(inputs[i][k]) & ((1 << VTA_INP_WIDTH) - 1);
+          sum += (acc_T) (input * static_cast<int>(weights[j][k]));
         } else {
           sum += (acc_T) (inputs[i][k] * weights[j][k]);
         }
@@ -1380,20 +1478,30 @@ int gemm_test(int batch, int in_channels, int out_channels, bool uop_compression
 
   // Prepare the input buffer
   uint32_t *input_buf = static_cast<uint32_t *>(allocBuffer(VTA_INP_ELEM_BYTES * inp_size));
-  packBuffer<uint32_t, 32, inp_T, VTA_INP_WIDTH>(input_buf,
-                                                 inputs,
-                                                 batch,
-                                                 in_channels,
-                                                 VTA_BATCH,
-                                                 VTA_BLOCK_IN);
+  if (int4) {
+    packBuffer<uint32_t, 32, inp_T, 4>(input_buf, inputs, batch, in_channels,
+                                       VTA_BATCH, VTA_BLOCK_IN);
+  } else {
+    packBuffer<uint32_t, 32, inp_T, VTA_INP_WIDTH>(input_buf,
+                                                   inputs,
+                                                   batch,
+                                                   in_channels,
+                                                   VTA_BATCH,
+                                                   VTA_BLOCK_IN);
+  }
   // Prepare the weight buffer
   uint32_t *weight_buf = static_cast<uint32_t *>(allocBuffer(VTA_WGT_ELEM_BYTES * wgt_size));
-  packBuffer<uint32_t, 32, wgt_T, VTA_WGT_WIDTH>(weight_buf,
-                                                 weights,
-                                                 out_channels,
-                                                 in_channels,
-                                                 VTA_BLOCK_OUT,
-                                                 VTA_BLOCK_IN);
+  if (int4) {
+    packBuffer<uint32_t, 32, wgt_T, 4>(weight_buf, weights, out_channels, in_channels,
+                                       VTA_BLOCK_OUT, VTA_BLOCK_IN);
+  } else {
+    packBuffer<uint32_t, 32, wgt_T, VTA_WGT_WIDTH>(weight_buf,
+                                                   weights,
+                                                   out_channels,
+                                                   in_channels,
+                                                   VTA_BLOCK_OUT,
+                                                   VTA_BLOCK_IN);
+  }
   // Prepare the bias buffer
   uint32_t *bias_buf = static_cast<uint32_t *>(allocBuffer(VTA_ACC_ELEM_BYTES * out_size));
   packBuffer<uint32_t, 32, acc_T, VTA_ACC_WIDTH>(bias_buf,
@@ -1471,6 +1579,346 @@ int gemm_test(int batch, int in_channels, int out_channels, bool uop_compression
     return 0;
   } else {
     printf("INFO - Blocked GEMM test failed, got %d errors!\n", err);
+    return -1;
+  }
+}
+
+int load_pad_test(int y_size, int x_size, int y_pad, int x_pad, int int4) {
+  printf("=====================================================================================\n");
+  printf("INFO - Padded load test: y_size=%d, x_size=%d, y_pad=%d, x_pad=%d, int4=%d\n",
+         y_size, x_size, y_pad, x_pad, int4);
+
+  // The input memory holds the padded y_size * x_size tensor, a GEMM with a
+  // single weight tensor reads all of its elements, padding included
+  int ins_size = 7;
+  int inp_size = y_size * x_size;
+  int x_total = x_size + 2 * x_pad;
+  int pad_size = (y_size + 2 * y_pad) * x_total;
+  // Make sure we don't exceed buffer bounds
+  assert(pad_size <= VTA_UOP_BUFF_DEPTH);
+  assert(pad_size <= VTA_INP_BUFF_DEPTH);
+  assert(pad_size <= VTA_ACC_BUFF_DEPTH);
+
+  // Initialize instruction buffer
+  VTAGenericInsn *insn_buf =
+      static_cast<VTAGenericInsn *>(allocBuffer(sizeof(VTAGenericInsn) * ins_size));
+  int insn_idx = 0;
+
+  // Load uops
+  insn_buf[insn_idx++] = get1DLoadStoreInsn(
+      VTA_OPCODE_LOAD, VTA_MEM_ID_UOP, 0, 0, pad_size, 0, 0, 0, 0);
+  // Load bias (push prev)
+  insn_buf[insn_idx++] = get1DLoadStoreInsn(
+      VTA_OPCODE_LOAD, VTA_MEM_ID_ACC, 0, 0, pad_size, 0, 0, 1, 0);
+  // Load weight block (pop next)
+  insn_buf[insn_idx++] = get1DLoadStoreInsn(
+      VTA_OPCODE_LOAD, VTA_MEM_ID_WGT, 0, 0, 1, 0, 1, 0, 0, int4 != 0, false);
+  // Load the input tensor with padding (push next)
+  insn_buf[insn_idx++] = get2DLoadStoreInsn(
+      VTA_OPCODE_LOAD,                                    // opcode
+      VTA_MEM_ID_INP,                                     // type
+      0,                                                  // sram offset
+      0,                                                  // dram offset
+      y_size,                                             // y size
+      x_size,                                             // x size
+      x_size,                                             // x stride
+      y_pad,                                              // y pad
+      x_pad,                                              // x pad
+      0,                                                  // pop prev dep
+      0,                                                  // pop next dep
+      0,                                                  // push prev dep
+      1,                                                  // push next dep
+      int4 != 0,                                          // int4
+      int4 == 2);                                         // int4 unsigned
+  // Perform GEMM (pop prev, push next)
+  insn_buf[insn_idx++] = getGEMMInsn(0, pad_size, 1, 1, false, 1, 0, 0, 1);
+  // Store output block (pop prev, push prev)
+  insn_buf[insn_idx++] = get1DLoadStoreInsn(
+      VTA_OPCODE_STORE, VTA_MEM_ID_OUT, 0, 0, pad_size, 1, 0, 1, 0);
+  // Finish
+  insn_buf[insn_idx++] = getFinishInsn(0, 1);
+
+  // Prepare the uop buffer
+  VTAUop * uop_buf = getGEMMUops(pad_size, 1, 1, false, 0);
+
+  // Initialize inputs, weights and biases
+  inp_T **inputs = allocInit2dArray<inp_T>(inp_size * VTA_BATCH, VTA_BLOCK_IN);
+  wgt_T **weights = allocInit2dArray<wgt_T>(VTA_BLOCK_OUT, VTA_BLOCK_IN);
+  acc_T **biases = allocInit2dArray<acc_T>(pad_size * VTA_BATCH, VTA_BLOCK_OUT);
+  // The DRAM holds packed 4 bit elements, keep the values in their range:
+  // the weights are signed, the inputs are unsigned when int4 is 2
+  if (int4) {
+    for (int i = 0; i < inp_size * VTA_BATCH; i++) {
+      for (int k = 0; k < VTA_BLOCK_IN; k++) {
+        int nibble = static_cast<int>(inputs[i][k]) & 0xF;
+        inputs[i][k] = static_cast<inp_T>(int4 == 2 ? nibble : (nibble ^ 8) - 8);
+      }
+    }
+    for (int j = 0; j < VTA_BLOCK_OUT; j++) {
+      for (int k = 0; k < VTA_BLOCK_IN; k++) {
+        int nibble = static_cast<int>(weights[j][k]) & 0xF;
+        weights[j][k] = static_cast<wgt_T>((nibble ^ 8) - 8);
+      }
+    }
+  }
+
+  // What the input memory has to contain: the tensor surrounded by zeros
+  inp_T **padded = alloc2dArray<inp_T>(pad_size * VTA_BATCH, VTA_BLOCK_IN);
+  for (int i = 0; i < pad_size * VTA_BATCH; i++) {
+    for (int k = 0; k < VTA_BLOCK_IN; k++) {
+      padded[i][k] = 0;
+    }
+  }
+  for (int y = 0; y < y_size; y++) {
+    for (int x = 0; x < x_size; x++) {
+      for (int b = 0; b < VTA_BATCH; b++) {
+        int src = (y * x_size + x) * VTA_BATCH + b;
+        int dst = ((y + y_pad) * x_total + x + x_pad) * VTA_BATCH + b;
+        for (int k = 0; k < VTA_BLOCK_IN; k++) {
+          padded[dst][k] = inputs[src][k];
+        }
+      }
+    }
+  }
+
+  // Reference GEMM implementation
+  out_T **outputs_ref = alloc2dArray<out_T>(pad_size * VTA_BATCH, VTA_BLOCK_OUT);
+  for (int i = 0; i < pad_size * VTA_BATCH; i++) {
+    for (int j = 0; j < VTA_BLOCK_OUT; j++) {
+      acc_T sum = biases[i][j];
+      for (int k = 0; k < VTA_BLOCK_IN; k++) {
+        sum += (acc_T) (padded[i][k] * weights[j][k]);
+      }
+      outputs_ref[i][j] = (out_T) sum;
+    }
+  }
+
+  // Prepare the input buffer
+  uint32_t *input_buf = static_cast<uint32_t *>(allocBuffer(VTA_INP_ELEM_BYTES * inp_size));
+  // Prepare the weight buffer
+  uint32_t *weight_buf = static_cast<uint32_t *>(allocBuffer(VTA_WGT_ELEM_BYTES));
+  if (int4) {
+    packBuffer<uint32_t, 32, inp_T, 4>(input_buf, inputs, inp_size * VTA_BATCH, VTA_BLOCK_IN,
+                                       VTA_BATCH, VTA_BLOCK_IN);
+    packBuffer<uint32_t, 32, wgt_T, 4>(weight_buf, weights, VTA_BLOCK_OUT, VTA_BLOCK_IN,
+                                       VTA_BLOCK_OUT, VTA_BLOCK_IN);
+  } else {
+    packBuffer<uint32_t, 32, inp_T, VTA_INP_WIDTH>(input_buf, inputs, inp_size * VTA_BATCH,
+                                                   VTA_BLOCK_IN, VTA_BATCH, VTA_BLOCK_IN);
+    packBuffer<uint32_t, 32, wgt_T, VTA_WGT_WIDTH>(weight_buf, weights, VTA_BLOCK_OUT,
+                                                   VTA_BLOCK_IN, VTA_BLOCK_OUT, VTA_BLOCK_IN);
+  }
+  // Prepare the bias buffer
+  uint32_t *bias_buf = static_cast<uint32_t *>(allocBuffer(VTA_ACC_ELEM_BYTES * pad_size));
+  packBuffer<uint32_t, 32, acc_T, VTA_ACC_WIDTH>(bias_buf, biases, pad_size * VTA_BATCH,
+                                                 VTA_BLOCK_OUT, VTA_BATCH, VTA_BLOCK_OUT);
+  // Prepare the output buffer
+  uint32_t *output_buf = static_cast<uint32_t *>(allocBuffer(VTA_OUT_ELEM_BYTES * pad_size));
+
+#ifdef NO_SIM
+  // Invoke the VTA
+  vta(ins_size, insn_buf, uop_buf, input_buf, weight_buf, bias_buf, output_buf);
+#else
+  // Invoke the VTA
+  vta(ins_size,
+      (volatile insn_T *) insn_buf,
+      (volatile uop_T *) uop_buf,
+      (volatile bus_T *) input_buf,
+      (volatile bus_T *) weight_buf,
+      (volatile bus_T *) bias_buf,
+      (volatile bus_T *) output_buf);
+#endif
+
+  // Unpack output data
+  out_T **outputs = alloc2dArray<out_T>(pad_size * VTA_BATCH, VTA_BLOCK_OUT);
+  unpackBuffer<out_T, VTA_OUT_WIDTH, uint32_t, 32>(outputs, output_buf, pad_size * VTA_BATCH,
+                                                   VTA_BLOCK_OUT, VTA_BATCH, VTA_BLOCK_OUT);
+
+  // Correctness checks
+  int err = 0;
+  for (int i = 0; i < pad_size * VTA_BATCH; i++) {
+    for (int j = 0; j < VTA_BLOCK_OUT; j++) {
+      if (outputs_ref[i][j] != outputs[i][j]) {
+        err++;
+#if VTA_DEBUG == 1
+        printf("DEBUG - %d, %d: expected 0x%x but got 0x%x\n", i, j,
+               static_cast<int>(outputs_ref[i][j]),
+               static_cast<int>(outputs[i][j]));
+#endif
+      }
+    }
+  }
+
+  // Free all allocated arrays
+  free2dArray<inp_T>(inputs, inp_size * VTA_BATCH, VTA_BLOCK_IN);
+  free2dArray<inp_T>(padded, pad_size * VTA_BATCH, VTA_BLOCK_IN);
+  free2dArray<wgt_T>(weights, VTA_BLOCK_OUT, VTA_BLOCK_IN);
+  free2dArray<acc_T>(biases, pad_size * VTA_BATCH, VTA_BLOCK_OUT);
+  free2dArray<out_T>(outputs_ref, pad_size * VTA_BATCH, VTA_BLOCK_OUT);
+  free2dArray<out_T>(outputs, pad_size * VTA_BATCH, VTA_BLOCK_OUT);
+  freeBuffer(insn_buf);
+  freeBuffer(uop_buf);
+  freeBuffer(input_buf);
+  freeBuffer(weight_buf);
+  freeBuffer(bias_buf);
+  freeBuffer(output_buf);
+
+  if (err == 0) {
+    printf("INFO - Padded load test successful!\n");
+    return 0;
+  } else {
+    printf("INFO - Padded load test failed, got %d errors!\n", err);
+    return -1;
+  }
+}
+
+int acc8_load_test(int y_size, int x_size, int y_pad, int x_pad, bool is_unsigned) {
+  printf("=====================================================================================\n");
+  printf("INFO - 8 bit accumulator load test: y_size=%d, x_size=%d, y_pad=%d, x_pad=%d, unsigned=%d\n",
+         y_size, x_size, y_pad, x_pad, is_unsigned);
+
+  // The 8 bit elements are loaded in the accumulator memory with padding. The
+  // output memory only gets the low 8 bits of the accumulator, so the load is
+  // done twice: an addition of zero outputs the bits of the elements and a
+  // shift right by 8 outputs the bits of their extension.
+  int rounds = 2;
+  int ins_size = 3 * rounds + 2;
+  int inp_size = y_size * x_size;
+  int x_total = x_size + 2 * x_pad;
+  int pad_size = (y_size + 2 * y_pad) * x_total;
+  // Make sure we don't exceed buffer bounds
+  assert(pad_size <= VTA_UOP_BUFF_DEPTH);
+  assert(pad_size <= VTA_ACC_BUFF_DEPTH);
+
+  // Initialize instruction buffer
+  VTAGenericInsn *insn_buf =
+      static_cast<VTAGenericInsn *>(allocBuffer(sizeof(VTAGenericInsn) * ins_size));
+  int insn_idx = 0;
+
+  // Load uops
+  insn_buf[insn_idx++] = get1DLoadStoreInsn(
+      VTA_OPCODE_LOAD, VTA_MEM_ID_UOP, 0, 0, pad_size, 0, 0, 0, 0);
+  for (int r = 0; r < rounds; r++) {
+    // Load the 8 bit elements in the accumulator (pop next if not first)
+    insn_buf[insn_idx++] = get2DLoadStoreInsn(
+        VTA_OPCODE_LOAD,                                  // opcode
+        VTA_MEM_ID_ACC_8BIT,                              // type
+        0,                                                // sram offset
+        0,                                                // dram offset
+        y_size,                                           // y size
+        x_size,                                           // x size
+        x_size,                                           // x stride
+        y_pad,                                            // y pad
+        x_pad,                                            // x pad
+        0,                                                // pop prev dep
+        r > 0,                                            // pop next dep
+        0,                                                // push prev dep
+        0,                                                // push next dep
+        false,                                            // int4
+        is_unsigned);                                     // is unsigned
+    // Add zero or shift right by 8 (push next)
+    insn_buf[insn_idx++] = getALUInsn(
+        r == 0 ? VTA_ALU_OPCODE_ADD : VTA_ALU_OPCODE_SHR,  // opcode
+        pad_size,                                         // vector size
+        true,                                             // use imm
+        r == 0 ? 0 : 8,                                   // imm
+        false,                                            // uop compression
+        0,                                                // pop prev dep
+        0,                                                // pop next dep
+        0,                                                // push prev dep
+        1);                                               // push next dep
+    // Store the output (pop prev, push prev)
+    insn_buf[insn_idx++] = get1DLoadStoreInsn(
+        VTA_OPCODE_STORE, VTA_MEM_ID_OUT, 0, r * pad_size, pad_size, 1, 0, 1, 0);
+  }
+  // Finish
+  insn_buf[insn_idx++] = getFinishInsn(0, 1);
+  // Prepare the uop buffer
+  VTAUop * uop_buf = getMapALUUops(pad_size, false);
+
+  // The 8 bit elements, as many as the ones of an accumulator tensor
+  inp_T **inputs = allocInit2dArray<inp_T>(inp_size * VTA_BATCH, VTA_BLOCK_OUT);
+
+  // Reference: the extended elements surrounded by zeros, then their low 8
+  // bits (first round) and the bits from 8 to 15 (second round)
+  out_T **outputs_ref = alloc2dArray<out_T>(rounds * pad_size * VTA_BATCH, VTA_BLOCK_OUT);
+  for (int i = 0; i < rounds * pad_size * VTA_BATCH; i++) {
+    for (int k = 0; k < VTA_BLOCK_OUT; k++) {
+      outputs_ref[i][k] = 0;
+    }
+  }
+  for (int y = 0; y < y_size; y++) {
+    for (int x = 0; x < x_size; x++) {
+      for (int b = 0; b < VTA_BATCH; b++) {
+        int src = (y * x_size + x) * VTA_BATCH + b;
+        int dst = ((y + y_pad) * x_total + x + x_pad) * VTA_BATCH + b;
+        for (int k = 0; k < VTA_BLOCK_OUT; k++) {
+          int elem = static_cast<int>(inputs[src][k]);
+          int extended = is_unsigned ? (elem & 0xFF) : elem;
+          outputs_ref[dst][k] = static_cast<out_T>(static_cast<int8_t>(extended & 0xFF));
+          outputs_ref[pad_size * VTA_BATCH + dst][k] =
+              static_cast<out_T>(static_cast<int8_t>((extended >> 8) & 0xFF));
+        }
+      }
+    }
+  }
+
+  // Prepare the buffer of the 8 bit elements and the output buffer
+  uint32_t *bias_buf = static_cast<uint32_t *>(allocBuffer(VTA_OUT_ELEM_BYTES * inp_size));
+  packBuffer<uint32_t, 32, inp_T, 8>(bias_buf, inputs, inp_size * VTA_BATCH, VTA_BLOCK_OUT,
+                                     VTA_BATCH, VTA_BLOCK_OUT);
+  uint32_t *output_buf =
+      static_cast<uint32_t *>(allocBuffer(VTA_OUT_ELEM_BYTES * rounds * pad_size));
+
+#ifdef NO_SIM
+  // Invoke the VTA
+  vta(ins_size, insn_buf, uop_buf, NULL, NULL, bias_buf, output_buf);
+#else
+  // Invoke the VTA
+  vta(ins_size,
+      (volatile insn_T *) insn_buf,
+      (volatile uop_T *) uop_buf,
+      (volatile bus_T *) NULL,
+      (volatile bus_T *) NULL,
+      (volatile bus_T *) bias_buf,
+      (volatile bus_T *) output_buf);
+#endif
+
+  // Unpack output buffer
+  out_T **outputs = alloc2dArray<out_T>(rounds * pad_size * VTA_BATCH, VTA_BLOCK_OUT);
+  unpackBuffer<out_T, VTA_OUT_WIDTH, uint32_t, 32>(outputs, output_buf,
+                                                   rounds * pad_size * VTA_BATCH,
+                                                   VTA_BLOCK_OUT, VTA_BATCH, VTA_BLOCK_OUT);
+
+  // Correctness checks
+  int err = 0;
+  for (int i = 0; i < rounds * pad_size * VTA_BATCH; i++) {
+    for (int j = 0; j < VTA_BLOCK_OUT; j++) {
+      if (outputs_ref[i][j] != outputs[i][j]) {
+        err++;
+#if VTA_DEBUG == 1
+        printf("DEBUG - %d, %d: expected 0x%x but got 0x%x\n", i, j,
+               static_cast<int>(outputs_ref[i][j]),
+               static_cast<int>(outputs[i][j]));
+#endif
+      }
+    }
+  }
+
+  // Free all allocated arrays
+  free2dArray<inp_T>(inputs, inp_size * VTA_BATCH, VTA_BLOCK_OUT);
+  free2dArray<out_T>(outputs_ref, rounds * pad_size * VTA_BATCH, VTA_BLOCK_OUT);
+  free2dArray<out_T>(outputs, rounds * pad_size * VTA_BATCH, VTA_BLOCK_OUT);
+  freeBuffer(insn_buf);
+  freeBuffer(uop_buf);
+  freeBuffer(bias_buf);
+  freeBuffer(output_buf);
+
+  if (err == 0) {
+    printf("INFO - 8 bit accumulator load test successful!\n");
+    return 0;
+  } else {
+    printf("INFO - 8 bit accumulator load test failed, got %d errors!\n", err);
     return -1;
   }
 }

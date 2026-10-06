@@ -197,7 +197,7 @@ VTAGenericInsn reset2DInsn(int type, int sram_offset, int y_size, int x_size, in
 */
 VTAGenericInsn get2DLoadStoreInsn(int opcode, int type, int sram_offset, int dram_offset,
   int y_size, int x_size, int x_stride, int y_pad, int x_pad, int pop_prev_dep, int pop_next_dep,
-  int push_prev_dep, int push_next_dep);
+  int push_prev_dep, int push_next_dep, bool int4 = false, bool is_unsigned = false);
 
 /*!
 * \brief Returns a VTA 1D load or store instruction.
@@ -213,7 +213,8 @@ VTAGenericInsn get2DLoadStoreInsn(int opcode, int type, int sram_offset, int dra
 * \return A VTAGenericInsn for a 1D load or store op.
 */
 VTAGenericInsn get1DLoadStoreInsn(int opcode, int type, int sram_offset, int dram_offset, int size,
-  int pop_prev_dep, int pop_next_dep, int push_prev_dep, int push_next_dep);
+  int pop_prev_dep, int pop_next_dep, int push_prev_dep, int push_next_dep, bool int4 = false,
+  bool is_unsigned = false);
 
 /*!
 * \brief Returns a VTA matrix multiplication instruction of size (a, b) x (b, c).
@@ -226,12 +227,13 @@ VTAGenericInsn get1DLoadStoreInsn(int opcode, int type, int sram_offset, int dra
 * \param pop_next_dep Pop dependence from next stage.
 * \param push_prev_dep Push dependence to previous stage.
 * \param push_next_dep Push dependence to next stage.
-* \param binary The inputs and weights are packed bits (1 is +1, 0 is -1).
+* \param binary The inputs and weights are packed bits (VTA_OPCODE_GEMM_BINARY).
+* \param inp_unsigned The inputs are unsigned.
 * \return A VTAGenericInsn for a GEMM op.
 */
 VTAGenericInsn getGEMMInsn(int uop_offset, int batch, int in_feat, int out_feat,
   bool uop_compression, int pop_prev_dep, int pop_next_dep, int push_prev_dep,
-  int push_next_dep, bool binary = false);
+  int push_next_dep, bool binary = false, bool inp_unsigned = false);
 
 /*!
 * \brief Returns a VTA ALU instruction for map type operation.
@@ -338,6 +340,31 @@ int blocked_gemm_test(int batch, int channels, int block, bool uop_compression,
 * \return Number of errors from the test run.
 */
 int gemm_test(int batch, int in_channels, int out_channels, bool uop_compression,
-              bool binary = false);
+              bool binary = false, int int4 = 0, bool inp_unsigned = false);
+
+/*!
+* \brief VTA load with padding unit test: a GEMM reads the whole padded input
+*   tensor, so its results depend on the tensor and on the zeros around it.
+* \param y_size Rows of the input tensor.
+* \param x_size Columns of the input tensor.
+* \param y_pad Rows of padding on each side.
+* \param x_pad Columns of padding on each side.
+* \param int4 The inputs and weights are packed 4 bit elements in DRAM, with
+*   signed (1) or unsigned (2) inputs.
+* \return Number of errors from the test run.
+*/
+int load_pad_test(int y_size, int x_size, int y_pad, int x_pad, int int4 = 0);
+
+/*!
+* \brief VTA unit test of the loads of 8 bit elements in the accumulator memory
+*   (VTA_MEM_ID_ACC_8BIT), with padding.
+* \param y_size Rows of the tensor.
+* \param x_size Columns of the tensor.
+* \param y_pad Rows of padding on each side.
+* \param x_pad Columns of padding on each side.
+* \param is_unsigned The elements are zero extended instead of sign extended.
+* \return Number of errors from the test run.
+*/
+int acc8_load_test(int y_size, int x_size, int y_pad, int x_pad, bool is_unsigned);
 
 #endif  //  TESTS_HARDWARE_COMMON_TEST_LIB_H_
