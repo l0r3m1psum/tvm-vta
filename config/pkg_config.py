@@ -187,7 +187,7 @@ class PkgConfig(object):
             self.fpga_board_rev = None
             # The HLS period is tighter than the clock to leave margin for routing
             self.fpga_freq = 150
-            self.fpga_per = 5.5
+            self.fpga_per = 5.0
             self.fpga_log_axi_bus_width = 6
             self.axi_prot_bits = '000'
             # IP register address map
@@ -196,11 +196,15 @@ class PkgConfig(object):
             self.load_base_addr = "0x43C01000"
             self.compute_base_addr = "0x43C02000"
             self.store_base_addr = "0x43C03000"
-        # Set coherence settings
-        coherent = True
+        # Set coherence settings. On the Zynq-7000 the memory ports are spread
+        # over the high performance ports (S_AXI_HP0-3) that bypass the caches
+        # of the CPU, so the buffers have to be flushed and invalidated.
+        coherent = self.fpga_family != "zynq-7000"
+        self.coherent = coherent
         if coherent:
             self.axi_cache_bits = '1111'
-            self.coherent = True
+        else:
+            self.axi_cache_bits = '0011'
 
         # Define IP memory mapped registers offsets.
         # In HLS 0x00-0x0C is reserved for block-level I/O protocol.

@@ -180,12 +180,24 @@ set_property -dict [ list \
   CONFIG.USE_LOCKED {false} \
 ] $pll_clk
 
-# Create instance: axi_smc0, and set properties
-set axi_smc0 [ create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:1.0 axi_smc0 ]
-set_property -dict [ list \
-  CONFIG.NUM_MI {1} \
-  CONFIG.NUM_SI {5} \
-] $axi_smc0
+# The memory ports of the modules, grouped by the slave port of the processing
+# system they are connected to; each group has its own interconnect (axi_smc0,
+# axi_smc1, ...), created once the processing system is known.
+if { $device_family eq "zynq-7000" } {
+  # One high performance port for each memory port (the compute module reads
+  # the micro-ops through its data port)
+  set maxi_groups [list \
+    [list fetch_0/m_axi_ins_port] \
+    [list load_0/m_axi_data_port] \
+    [list compute_0/m_axi_data_port] \
+    [list store_0/m_axi_data_port] \
+  ]
+} else {
+  set maxi_groups [list \
+    [list fetch_0/m_axi_ins_port load_0/m_axi_data_port \
+          compute_0/m_axi_data_port store_0/m_axi_data_port] \
+  ]
+}
 
 # Create instance: axi_xbar, and set properties
 set axi_xbar \
@@ -214,8 +226,6 @@ set compute_0 [ create_bd_cell -type ip -vlnv xilinx.com:hls:compute:1.0 compute
 set_property -dict [ list \
   CONFIG.C_M_AXI_DATA_PORT_CACHE_VALUE $axi_cache \
   CONFIG.C_M_AXI_DATA_PORT_PROT_VALUE $axi_prot \
-  CONFIG.C_M_AXI_UOP_PORT_CACHE_VALUE $axi_cache \
-  CONFIG.C_M_AXI_UOP_PORT_PROT_VALUE $axi_prot \
 ] $compute_0
 
 # Create instance: store_0, and set properties
@@ -318,8 +328,10 @@ if { $device_family eq "zynq-7000" } {
   set_property -dict [ list \
     CONFIG.PCW_EN_CLK0_PORT {1} \
     CONFIG.PCW_FPGA0_PERIPHERAL_FREQMHZ {100} \
-    CONFIG.PCW_USE_DEFAULT_ACP_USER_VAL {1} \
-    CONFIG.PCW_USE_S_AXI_ACP {1} \
+    CONFIG.PCW_USE_S_AXI_HP0 {1} \
+    CONFIG.PCW_USE_S_AXI_HP1 {1} \
+    CONFIG.PCW_USE_S_AXI_HP2 {1} \
+    CONFIG.PCW_USE_S_AXI_HP3 {1} \
     CONFIG.preset {ZC702} \
     CONFIG.PCW_USE_FABRIC_INTERRUPT {1} \
     CONFIG.PCW_IRQ_F2P_INTR {1} \
@@ -333,9 +345,17 @@ if { $device_family eq "zynq-7000" } {
   set ps_clk    [get_bd_pins processing_system/FCLK_CLK0]
   set ps_rstn   [get_bd_pins processing_system/FCLK_RESET0_N]
   set maxi_clk  [get_bd_pins processing_system/M_AXI_GP0_ACLK]
-  set saxi_clk  [get_bd_pins processing_system/S_AXI_ACP_ACLK]
   set maxi      [get_bd_intf_pins processing_system/M_AXI_GP0]
-  set saxi      [get_bd_intf_pins processing_system/S_AXI_ACP]
+  # Slave ports of the groups of memory ports, their clocks and address segments
+  set saxi_list {}
+  set saxi_clk_list {}
+  set saxi_seg_list {}
+  for {set i 0} {$i < [llength $maxi_groups]} {incr i} {
+    lappend saxi_list [get_bd_intf_pins processing_system/S_AXI_HP${i}]
+    lappend saxi_clk_list [get_bd_pins processing_system/S_AXI_HP${i}_ACLK]
+    lappend saxi_seg_list processing_system/S_AXI_HP${i}/HP${i}_DDR_LOWOCM
+  }
+  set saxi_seg_range 0x40000000
 } elseif { $device_family eq "zynq-ultrascale+" } {
   set processing_system [ create_bd_cell -type ip -vlnv xilinx.com:ip:zynq_ultra_ps_e:3.3 processing_system ]
   apply_bd_automation -rule xilinx.com:bd_rule:zynq_ultra_ps_e -config {apply_board_preset "1" }  [get_bd_cells processing_system]
@@ -351,9 +371,73 @@ if { $device_family eq "zynq-7000" } {
   set ps_clk    [get_bd_pins processing_system/pl_clk0]
   set ps_rstn   [get_bd_pins processing_system/pl_resetn0]
   set maxi_clk  [get_bd_pins processing_system/maxihpm0_fpd_aclk]
-  set saxi_clk  [get_bd_pins processing_system/saxihpc0_fpd_aclk]
   set maxi      [get_bd_intf_pins processing_system/M_AXI_HPM0_FPD]
-  set saxi      [get_bd_intf_pins processing_system/S_AXI_HPC0_FPD]
+  set saxi_list [list [get_bd_intf_pins processing_system/S_AXI_HPC0_FPD]]
+  set saxi_clk_list [list [get_bd_pins processing_system/saxihpc0_fpd_aclk]]
+  set saxi_seg_list [list processing_system/SAXIGP0/HPC0_DDR_LOW]
+  set saxi_seg_range 0x80000000
+}
+
+# The m_axi interfaces of HLS have the 2 bit lock signals of AXI3 even if they
+# are AXI4 ones, where they are 1 bit wide: only the low bit gets connected and
+# the modules never lock, so the warnings about it say nothing.
+set_msg_config -id {BD 41-2384} -string {LOCK} -suppress
+
+# Connect each group of memory ports to its slave port
+set axi_smc_aclk_list {}
+set axi_smc_aresetn_list {}
+for {set i 0} {$i < [llength $maxi_groups]} {incr i} {
+  set group [lindex $maxi_groups $i]
+  if { $device_family eq "zynq-7000" && [llength $group] == 1 } {
+    # A single memory port as wide as the AXI3 slave port only needs its
+    # protocol converted. The bursts of the modules are at most 16 beats long
+    # (the default of the m_axi interface of HLS), the longest of AXI3, so
+    # they don't have to be split, which is what limits the clock in the
+    # SmartConnect.
+    set axi_smc [ create_bd_cell -type ip -vlnv xilinx.com:ip:axi_protocol_converter:2.1 axi_smc${i} ]
+    set_property -dict [ list \
+      CONFIG.SI_PROTOCOL {AXI4} \
+      CONFIG.MI_PROTOCOL {AXI3} \
+      CONFIG.TRANSLATION_MODE {0} \
+    ] $axi_smc
+    if { [lindex $group 0] eq "store_0/m_axi_data_port" } {
+      # The converter answers the write data channel with logic that depends
+      # on a register with an asynchronous reset, and in the store module that
+      # answer selects the address of the block RAM that buffers the data
+      # (DRC REQP-1839). A register slice keeps the two apart.
+      set axi_reg [ create_bd_cell -type ip -vlnv xilinx.com:ip:axi_register_slice:2.1 axi_reg${i} ]
+      connect_bd_intf_net \
+        [get_bd_intf_pins axi_reg${i}/S_AXI] \
+        [get_bd_intf_pins [lindex $group 0]]
+      connect_bd_intf_net \
+        [get_bd_intf_pins axi_smc${i}/S_AXI] \
+        [get_bd_intf_pins axi_reg${i}/M_AXI]
+      lappend axi_smc_aclk_list [get_bd_pins axi_reg${i}/aclk]
+      lappend axi_smc_aresetn_list [get_bd_pins axi_reg${i}/aresetn]
+    } else {
+      connect_bd_intf_net \
+        [get_bd_intf_pins axi_smc${i}/S_AXI] \
+        [get_bd_intf_pins [lindex $group 0]]
+    }
+    set axi_smc_maxi [get_bd_intf_pins axi_smc${i}/M_AXI]
+  } else {
+    set axi_smc [ create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:1.0 axi_smc${i} ]
+    set_property -dict [ list \
+      CONFIG.NUM_MI {1} \
+      CONFIG.NUM_SI [llength $group] \
+    ] $axi_smc
+    for {set j 0} {$j < [llength $group]} {incr j} {
+      connect_bd_intf_net \
+        [get_bd_intf_pins axi_smc${i}/S0${j}_AXI] \
+        [get_bd_intf_pins [lindex $group $j]]
+    }
+    set axi_smc_maxi [get_bd_intf_pins axi_smc${i}/M00_AXI]
+  }
+  connect_bd_intf_net -intf_net axi_smc${i}_M00_AXI \
+    $axi_smc_maxi \
+    [lindex $saxi_list $i]
+  lappend axi_smc_aclk_list [get_bd_pins axi_smc${i}/aclk]
+  lappend axi_smc_aresetn_list [get_bd_pins axi_smc${i}/aresetn]
 }
 
 # Create interface connections
@@ -375,12 +459,6 @@ connect_bd_intf_net -intf_net l2g_queue_M_AXIS [get_bd_intf_pins compute_0/l2g_d
 connect_bd_intf_net -intf_net g2l_queue_M_AXIS [get_bd_intf_pins g2l_queue/M_AXIS] [get_bd_intf_pins load_0/g2l_dep_queue_V]
 connect_bd_intf_net -intf_net g2s_queue_M_AXIS [get_bd_intf_pins g2s_queue/M_AXIS] [get_bd_intf_pins store_0/g2s_dep_queue_V]
 connect_bd_intf_net -intf_net s2g_queue_M_AXIS [get_bd_intf_pins compute_0/s2g_dep_queue_V] [get_bd_intf_pins s2g_queue/M_AXIS]
-connect_bd_intf_net -intf_net fetch_0_m_axi_ins_port [get_bd_intf_pins axi_smc0/S00_AXI] [get_bd_intf_pins fetch_0/m_axi_ins_port]
-connect_bd_intf_net -intf_net load_0_m_axi_data_port [get_bd_intf_pins axi_smc0/S01_AXI] [get_bd_intf_pins load_0/m_axi_data_port]
-connect_bd_intf_net -intf_net compute_0_m_axi_uop_port [get_bd_intf_pins axi_smc0/S02_AXI] [get_bd_intf_pins compute_0/m_axi_uop_port]
-connect_bd_intf_net -intf_net compute_0_m_axi_data_port [get_bd_intf_pins axi_smc0/S03_AXI] [get_bd_intf_pins compute_0/m_axi_data_port]
-connect_bd_intf_net -intf_net store_0_m_axi_data_port [get_bd_intf_pins axi_smc0/S04_AXI] [get_bd_intf_pins store_0/m_axi_data_port]
-connect_bd_intf_net -intf_net axi_smc0_M00_AXI [get_bd_intf_pins axi_smc0/M00_AXI] $saxi
 connect_bd_intf_net -intf_net processing_system_m_axi [get_bd_intf_pins axi_xbar/S00_AXI] $maxi
 
 # Create port connections
@@ -396,7 +474,7 @@ connect_bd_net -net proc_sys_reset_interconnect_aresetn \
   [get_bd_pins proc_sys_reset/interconnect_aresetn]
 connect_bd_net -net proc_sys_reset_peripheral_aresetn \
   [get_bd_pins proc_sys_reset/peripheral_aresetn] \
-  [get_bd_pins axi_smc0/aresetn] \
+  {*}$axi_smc_aresetn_list \
   [get_bd_pins axi_xbar/M00_ARESETN] \
   [get_bd_pins axi_xbar/M01_ARESETN] \
   [get_bd_pins axi_xbar/M02_ARESETN] \
@@ -416,7 +494,7 @@ connect_bd_net -net proc_sys_reset_peripheral_aresetn \
 connect_bd_net -net processing_system_clk \
   [get_bd_pins pll_clk/clk_out1] \
   [get_bd_pins proc_sys_reset/slowest_sync_clk] \
-  [get_bd_pins axi_smc0/aclk] \
+  {*}$axi_smc_aclk_list \
   [get_bd_pins axi_xbar/ACLK] \
   [get_bd_pins axi_xbar/M00_ACLK] \
   [get_bd_pins axi_xbar/M01_ACLK] \
@@ -435,7 +513,7 @@ connect_bd_net -net processing_system_clk \
   [get_bd_pins g2s_queue/s_aclk] \
   [get_bd_pins s2g_queue/s_aclk] \
   $maxi_clk \
-  $saxi_clk
+  {*}$saxi_clk_list
 
 # The interrupt raised by the FINISH instruction goes to the first PL to PS
 # interrupt line (IRQ_F2P[0])
@@ -450,18 +528,16 @@ create_bd_addr_seg -range $ip_reg_map_range -offset $fetch_base_addr [get_bd_add
 create_bd_addr_seg -range $ip_reg_map_range -offset $load_base_addr [get_bd_addr_spaces processing_system/Data] [get_bd_addr_segs load_0/s_axi_CONTROL_BUS/Reg] SEG_load_0_Reg
 create_bd_addr_seg -range $ip_reg_map_range -offset $compute_base_addr [get_bd_addr_spaces processing_system/Data] [get_bd_addr_segs compute_0/s_axi_CONTROL_BUS/Reg] SEG_compute_0_Reg
 create_bd_addr_seg -range $ip_reg_map_range -offset $store_base_addr [get_bd_addr_spaces processing_system/Data] [get_bd_addr_segs store_0/s_axi_CONTROL_BUS/Reg] SEG_store_0_Reg
-if { $device_family eq "zynq-7000" } {
-  create_bd_addr_seg -range 0x40000000 -offset 0x00000000 [get_bd_addr_spaces compute_0/Data_m_axi_uop_port] [get_bd_addr_segs processing_system/S_AXI_ACP/ACP_DDR_LOWOCM] SEG_processing_system_ACP_DDR_LOWOCM
-  create_bd_addr_seg -range 0x40000000 -offset 0x00000000 [get_bd_addr_spaces compute_0/Data_m_axi_data_port] [get_bd_addr_segs processing_system/S_AXI_ACP/ACP_DDR_LOWOCM] SEG_processing_system_ACP_DDR_LOWOCM
-  create_bd_addr_seg -range 0x40000000 -offset 0x00000000 [get_bd_addr_spaces fetch_0/Data_m_axi_ins_port] [get_bd_addr_segs processing_system/S_AXI_ACP/ACP_DDR_LOWOCM] SEG_processing_system_ACP_DDR_LOWOCM
-  create_bd_addr_seg -range 0x40000000 -offset 0x00000000 [get_bd_addr_spaces load_0/Data_m_axi_data_port] [get_bd_addr_segs processing_system/S_AXI_ACP/ACP_DDR_LOWOCM] SEG_processing_system_ACP_DDR_LOWOCM
-  create_bd_addr_seg -range 0x40000000 -offset 0x00000000 [get_bd_addr_spaces store_0/Data_m_axi_data_port] [get_bd_addr_segs processing_system/S_AXI_ACP/ACP_DDR_LOWOCM] SEG_processing_system_ACP_DDR_LOWOCM
-} elseif { $device_family eq "zynq-ultrascale+"} {
-  create_bd_addr_seg -range 0x80000000 -offset 0x00000000 [get_bd_addr_spaces fetch_0/Data_m_axi_ins_port] [get_bd_addr_segs processing_system/SAXIGP0/HPC0_DDR_LOW] SEG_processing_system_HPC0_DDR_LOW
-  create_bd_addr_seg -range 0x80000000 -offset 0x00000000 [get_bd_addr_spaces load_0/Data_m_axi_data_port] [get_bd_addr_segs processing_system/SAXIGP0/HPC0_DDR_LOW] SEG_processing_system_HPC0_DDR_LOW
-  create_bd_addr_seg -range 0x80000000 -offset 0x00000000 [get_bd_addr_spaces compute_0/Data_m_axi_uop_port] [get_bd_addr_segs processing_system/SAXIGP0/HPC0_DDR_LOW] SEG_processing_system_HPC0_DDR_LOW
-  create_bd_addr_seg -range 0x80000000 -offset 0x00000000 [get_bd_addr_spaces compute_0/Data_m_axi_data_port] [get_bd_addr_segs processing_system/SAXIGP0/HPC0_DDR_LOW] SEG_processing_system_HPC0_DDR_LOW
-  create_bd_addr_seg -range 0x80000000 -offset 0x00000000 [get_bd_addr_spaces store_0/Data_m_axi_data_port] [get_bd_addr_segs processing_system/SAXIGP0/HPC0_DDR_LOW] SEG_processing_system_HPC0_DDR_LOW
+# Each memory port sees the DDR through the slave port of its group
+for {set i 0} {$i < [llength $maxi_groups]} {incr i} {
+  foreach port [lindex $maxi_groups $i] {
+    # The address space of compute_0/m_axi_data_port is compute_0/Data_m_axi_data_port
+    set space [string map {/ /Data_} $port]
+    create_bd_addr_seg -range $saxi_seg_range -offset 0x00000000 \
+      [get_bd_addr_spaces $space] \
+      [get_bd_addr_segs [lindex $saxi_seg_list $i]] \
+      SEG_processing_system_DDR_${i}
+  }
 }
 
 save_bd_design

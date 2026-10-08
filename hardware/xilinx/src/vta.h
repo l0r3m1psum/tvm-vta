@@ -125,7 +125,7 @@ typedef ap_int<VTA_MUL_ARG_BIT_WIDTH> aluop_mul_arg_T;
 */
 void fetch(
   uint32_t insn_count,
-  volatile insn_T *insns,
+  volatile bus_T *insns,
   hls::stream<insn_T> &load_queue,
   hls::stream<insn_T> &gemm_queue,
   hls::stream<insn_T> &store_queue);
@@ -182,7 +182,7 @@ void load(
 void compute(
   volatile uint32_t &done,
   bool &done_irq,
-  volatile uop_T *uops,
+  volatile bus_T *uops,
   volatile bus_T *biases,
   hls::stream<insn_T> &gemm_queue,
   hls::stream<bool> &l2g_dep_queue,
@@ -226,8 +226,8 @@ void store(
 */
 void vta(
   uint32_t insn_count,
-  volatile insn_T *insns,
-  volatile uop_T *uops,
+  volatile bus_T *insns,
+  volatile bus_T *uops,
   volatile bus_T *inputs,
   volatile bus_T *weights,
   volatile bus_T *biases,

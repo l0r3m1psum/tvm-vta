@@ -367,4 +367,14 @@ int load_pad_test(int y_size, int x_size, int y_pad, int x_pad, int int4 = 0);
 */
 int acc8_load_test(int y_size, int x_size, int y_pad, int x_pad, bool is_unsigned);
 
+/*!
+* \brief VTA unit test of the load of the micro-ops, that are read as bus words
+*   holding more than one of them: an ALU operation uses micro-ops loaded from
+*   a given offset.
+* \param vector_size Number of micro-ops (tensors of the ALU operation).
+* \param uop_offset Offset of the micro-ops in DRAM.
+* \return Number of errors from the test run.
+*/
+int uop_load_test(int vector_size, int uop_offset);
+
 #endif  //  TESTS_HARDWARE_COMMON_TEST_LIB_H_

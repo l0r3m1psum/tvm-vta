@@ -458,7 +458,7 @@ VTAUop * getCopyUops(int y_size, int x_size, int uop_compression) {
 #ifdef NO_SIM
   VTAUop *uop_buf = static_cast<VTAUop *>(VTAMemAlloc(sizeof(VTAUop) * uop_size, VTA_CACHED));
 #else
-  VTAUop *uop_buf = static_cast<VTAUop *>(malloc(sizeof(VTAUop) * uop_size));
+  VTAUop *uop_buf = static_cast<VTAUop *>(malloc(sizeof(VTAUop) * (uop_size + 1)));
 #endif
 
   if (!uop_compression) {
@@ -490,7 +490,7 @@ VTAUop * getGEMMUops(int batch, int in_feat, int out_feat, bool uop_compression,
 #ifdef NO_SIM
   VTAUop *uop_buf = static_cast<VTAUop *>(VTAMemAlloc(sizeof(VTAUop) * uop_size, VTA_CACHED));
 #else
-  VTAUop *uop_buf = static_cast<VTAUop *>(malloc(sizeof(VTAUop) * uop_size));
+  VTAUop *uop_buf = static_cast<VTAUop *>(malloc(sizeof(VTAUop) * (uop_size + 1)));
 #endif
 
   if (!uop_compression) {
@@ -546,7 +546,7 @@ VTAUop * getMapALUUops(int vector_size, bool uop_compression) {
 #ifdef NO_SIM
   VTAUop *uop_buf = static_cast<VTAUop *>(VTAMemAlloc(sizeof(VTAUop) * uop_size, VTA_CACHED));
 #else
-  VTAUop *uop_buf = static_cast<VTAUop *>(malloc(sizeof(VTAUop) * uop_size));
+  VTAUop *uop_buf = static_cast<VTAUop *>(malloc(sizeof(VTAUop) * (uop_size + 1)));
 #endif
 
   if (!uop_compression) {
@@ -974,8 +974,8 @@ int alu_test(int opcode, bool use_imm, int batch, int vector_size, bool uop_comp
 #else
   // Invoke the VTA
   vta(ins_size,
-      (volatile insn_T *) insn_buf,
-      (volatile uop_T *) uop_buf,
+      (volatile bus_T *) insn_buf,
+      (volatile bus_T *) uop_buf,
       (volatile bus_T *) NULL,
       (volatile bus_T *) NULL,
       (volatile bus_T *) bias_buf,
@@ -1251,8 +1251,8 @@ int blocked_gemm_test(int batch, int channels, int block, bool uop_compression,
 #else
   // Invoke the VTA
   vta(ins_size,
-      (volatile insn_T *) insn_buf,
-      (volatile uop_T *) uop_buf,
+      (volatile bus_T *) insn_buf,
+      (volatile bus_T *) uop_buf,
       (volatile bus_T *) input_buf,
       (volatile bus_T *) weight_buf,
       (volatile bus_T *) bias_buf,
@@ -1529,8 +1529,8 @@ int gemm_test(int batch, int in_channels, int out_channels, bool uop_compression
 #else
   // Invoke the VTA
   vta(ins_size,
-      (volatile insn_T *) insn_buf,
-      (volatile uop_T *) uop_buf,
+      (volatile bus_T *) insn_buf,
+      (volatile bus_T *) uop_buf,
       (volatile bus_T *) input_buf,
       (volatile bus_T *) weight_buf,
       (volatile bus_T *) bias_buf,
@@ -1721,8 +1721,8 @@ int load_pad_test(int y_size, int x_size, int y_pad, int x_pad, int int4) {
 #else
   // Invoke the VTA
   vta(ins_size,
-      (volatile insn_T *) insn_buf,
-      (volatile uop_T *) uop_buf,
+      (volatile bus_T *) insn_buf,
+      (volatile bus_T *) uop_buf,
       (volatile bus_T *) input_buf,
       (volatile bus_T *) weight_buf,
       (volatile bus_T *) bias_buf,
@@ -1876,8 +1876,8 @@ int acc8_load_test(int y_size, int x_size, int y_pad, int x_pad, bool is_unsigne
 #else
   // Invoke the VTA
   vta(ins_size,
-      (volatile insn_T *) insn_buf,
-      (volatile uop_T *) uop_buf,
+      (volatile bus_T *) insn_buf,
+      (volatile bus_T *) uop_buf,
       (volatile bus_T *) NULL,
       (volatile bus_T *) NULL,
       (volatile bus_T *) bias_buf,
@@ -1919,6 +1919,122 @@ int acc8_load_test(int y_size, int x_size, int y_pad, int x_pad, bool is_unsigne
     return 0;
   } else {
     printf("INFO - 8 bit accumulator load test failed, got %d errors!\n", err);
+    return -1;
+  }
+}
+
+int uop_load_test(int vector_size, int uop_offset) {
+  printf("=====================================================================================\n");
+  printf("INFO - Micro-op load test: vector_size=%d, uop_offset=%d\n", vector_size, uop_offset);
+
+  // The micro-ops are read as bus words that hold more than one of them, so
+  // they are loaded from an offset and with a size that are not multiples of
+  // a bus word; an ALU operation over the tensors they point to checks them.
+  const int imm = 5;
+  const int ins_size = 5;
+  // Make sure we don't exceed buffer bounds
+  assert(vector_size <= VTA_UOP_BUFF_DEPTH);
+  assert(vector_size <= VTA_ACC_BUFF_DEPTH);
+
+  // Initialize instruction buffer
+  VTAGenericInsn *insn_buf =
+      static_cast<VTAGenericInsn *>(allocBuffer(sizeof(VTAGenericInsn) * ins_size));
+  int insn_idx = 0;
+  // Load the micro-ops and the accumulator, add the immediate (push next),
+  // store the output (pop prev, push prev) and finish (pop next)
+  insn_buf[insn_idx++] = get1DLoadStoreInsn(
+      VTA_OPCODE_LOAD, VTA_MEM_ID_UOP, 0, uop_offset, vector_size, 0, 0, 0, 0);
+  insn_buf[insn_idx++] = get1DLoadStoreInsn(
+      VTA_OPCODE_LOAD, VTA_MEM_ID_ACC, 0, 0, vector_size, 0, 0, 0, 0);
+  insn_buf[insn_idx++] = getALUInsn(
+      VTA_ALU_OPCODE_ADD, vector_size, true, imm, false, 0, 0, 0, 1);
+  insn_buf[insn_idx++] = get1DLoadStoreInsn(
+      VTA_OPCODE_STORE, VTA_MEM_ID_OUT, 0, 0, vector_size, 1, 0, 1, 0);
+  insn_buf[insn_idx++] = getFinishInsn(0, 1);
+  assert(insn_idx == ins_size);
+
+  // The micro-ops start at uop_offset, the ones around them all point to the
+  // first tensor: if they were loaded it would be added twice
+  int uop_size = uop_offset + vector_size + 2;
+#ifdef NO_SIM
+  VTAUop *uop_buf = static_cast<VTAUop *>(VTAMemAlloc(sizeof(VTAUop) * uop_size, VTA_CACHED));
+#else
+  VTAUop *uop_buf = static_cast<VTAUop *>(malloc(sizeof(VTAUop) * (uop_size + 1)));
+#endif
+  for (int i = 0; i < uop_size; i++) {
+    int idx = i - uop_offset;
+    bool used = idx >= 0 && idx < vector_size;
+    uop_buf[i].dst_idx = used ? idx : 0;
+    uop_buf[i].src_idx = 0;
+    uop_buf[i].wgt_idx = 0;
+  }
+
+  // Accumulator tensors and reference outputs
+  acc_T **inputs = allocInit2dArray<acc_T>(vector_size * VTA_BATCH, VTA_BLOCK_OUT);
+  out_T **outputs_ref = alloc2dArray<out_T>(vector_size * VTA_BATCH, VTA_BLOCK_OUT);
+  for (int i = 0; i < vector_size * VTA_BATCH; i++) {
+    for (int j = 0; j < VTA_BLOCK_OUT; j++) {
+      acc_T sum = inputs[i][j] + imm;
+      outputs_ref[i][j] = (out_T) sum;
+    }
+  }
+
+  // Prepare the accumulator buffer and the output buffer
+  uint32_t *bias_buf =
+      static_cast<uint32_t *>(allocBuffer(VTA_ACC_ELEM_BYTES * vector_size));
+  packBuffer<uint32_t, 32, acc_T, VTA_ACC_WIDTH>(bias_buf, inputs, vector_size * VTA_BATCH,
+                                                 VTA_BLOCK_OUT, VTA_BATCH, VTA_BLOCK_OUT);
+  uint32_t *output_buf =
+      static_cast<uint32_t *>(allocBuffer(VTA_OUT_ELEM_BYTES * vector_size));
+
+#ifdef NO_SIM
+  // Invoke the VTA
+  vta(ins_size, insn_buf, uop_buf, NULL, NULL, bias_buf, output_buf);
+#else
+  // Invoke the VTA
+  vta(ins_size,
+      (volatile bus_T *) insn_buf,
+      (volatile bus_T *) uop_buf,
+      (volatile bus_T *) NULL,
+      (volatile bus_T *) NULL,
+      (volatile bus_T *) bias_buf,
+      (volatile bus_T *) output_buf);
+#endif
+
+  // Unpack output buffer
+  out_T **outputs = alloc2dArray<out_T>(vector_size * VTA_BATCH, VTA_BLOCK_OUT);
+  unpackBuffer<out_T, VTA_OUT_WIDTH, uint32_t, 32>(outputs, output_buf, vector_size * VTA_BATCH,
+                                                   VTA_BLOCK_OUT, VTA_BATCH, VTA_BLOCK_OUT);
+
+  // Correctness checks
+  int err = 0;
+  for (int i = 0; i < vector_size * VTA_BATCH; i++) {
+    for (int j = 0; j < VTA_BLOCK_OUT; j++) {
+      if (outputs_ref[i][j] != outputs[i][j]) {
+        err++;
+#if VTA_DEBUG == 1
+        printf("DEBUG - %d, %d: expected 0x%x but got 0x%x\n", i, j,
+               static_cast<int>(outputs_ref[i][j]),
+               static_cast<int>(outputs[i][j]));
+#endif
+      }
+    }
+  }
+
+  // Free all allocated arrays
+  free2dArray<acc_T>(inputs, vector_size * VTA_BATCH, VTA_BLOCK_OUT);
+  free2dArray<out_T>(outputs_ref, vector_size * VTA_BATCH, VTA_BLOCK_OUT);
+  free2dArray<out_T>(outputs, vector_size * VTA_BATCH, VTA_BLOCK_OUT);
+  freeBuffer(insn_buf);
+  freeBuffer(uop_buf);
+  freeBuffer(bias_buf);
+  freeBuffer(output_buf);
+
+  if (err == 0) {
+    printf("INFO - Micro-op load test successful!\n");
+    return 0;
+  } else {
+    printf("INFO - Micro-op load test failed, got %d errors!\n", err);
     return -1;
   }
 }

@@ -225,7 +225,7 @@ void write_tensor(
 
 void fetch(
   uint32_t insn_count,
-  volatile insn_T *insns,
+  volatile bus_T *insns,
   hls::stream<insn_T> &load_queue,
   hls::stream<insn_T> &gemm_queue,
   hls::stream<insn_T> &store_queue) {
@@ -236,26 +236,40 @@ PRAGMA_HLS(HLS INTERFACE s_axilite port = insn_count bundle = CONTROL_BUS offset
 #pragma HLS INTERFACE axis port = store_queue
 #pragma HLS INTERFACE s_axilite port = return bundle = CONTROL_BUS
 
-  INSN_DECODE: for (int pc = 0; pc < insn_count; pc++) {
-#pragma HLS PIPELINE
-    // Read instruction fields
-    insn_T raw_insn = insns[pc];
-    VTAInsn insn;
-    insn.generic = *((VTAGenericInsn *) &raw_insn);
-    // Do some partial decoding
-    opcode_T opcode = insn.generic.opcode;
-    memop_id_T memory_type = insn.mem.memory_type;
-    // Push to appropriate instruction queue
-    if (opcode == VTA_OPCODE_STORE) {
-      store_queue.write(raw_insn);
-    } else if (opcode == VTA_OPCODE_LOAD) {
-      if (memory_type == VTA_MEM_ID_INP || memory_type == VTA_MEM_ID_WGT) {
-        load_queue.write(raw_insn);
+  // The instructions are read one bus word at a time, so that the port is as
+  // wide as the data ones
+  const int words = VTA_INS_WIDTH / VTA_BUS_WIDTH;
+  typedef ap_uint<32 + VTA_LOG_INS_WIDTH - VTA_LOG_BUS_WIDTH + 1> insn_word_T;
+  insn_word_T word_count = (insn_word_T) insn_count * words;
+  insn_T raw_insn = 0;
+  INSN_DECODE: for (insn_word_T i = 0; i < word_count; i++) {
+#pragma HLS PIPELINE II = 1
+    int j = i % words;
+    bus_T word = insns[i];
+    if (j == 0) {
+      raw_insn = word;
+    } else {
+      raw_insn |= (insn_T) word << (j * VTA_BUS_WIDTH);
+    }
+    if (j == words - 1) {
+      // Read instruction fields
+      VTAInsn insn;
+      insn.generic = *((VTAGenericInsn *) &raw_insn);
+      // Do some partial decoding
+      opcode_T opcode = insn.generic.opcode;
+      memop_id_T memory_type = insn.mem.memory_type;
+      // Push to appropriate instruction queue
+      if (opcode == VTA_OPCODE_STORE) {
+        store_queue.write(raw_insn);
+      } else if (opcode == VTA_OPCODE_LOAD) {
+        if (memory_type == VTA_MEM_ID_INP || memory_type == VTA_MEM_ID_WGT) {
+          load_queue.write(raw_insn);
+        } else {
+          gemm_queue.write(raw_insn);
+        }
       } else {
         gemm_queue.write(raw_insn);
       }
-    } else {
-      gemm_queue.write(raw_insn);
     }
   }
 }
@@ -342,6 +356,16 @@ void load(
   }
 }
 
+// A register in a pipeline: the value returned is the one given a clock cycle
+// before. HLS places the registers of a pipeline by itself and only knows the
+// delays of the logic, this is for the values with long routes.
+uop_T pipeline_reg(uop_T value) {
+#pragma HLS INLINE off
+#pragma HLS PIPELINE II = 1
+#pragma HLS LATENCY min = 1 max = 1
+  return value;
+}
+
 // Binary GEMM only uses LUTs and shares the accumulators with the integer GEMM.
 #if VTA_INP_WIDTH == VTA_WGT_WIDTH
 #define VTA_BINARY_GEMM
@@ -403,10 +427,13 @@ void gemm(
     // Decode indices
     acc_idx_T dst_idx =
         uop.range(VTA_UOP_GEM_0_1, VTA_UOP_GEM_0_0) + dst_offset_in;
-    inp_idx_T src_idx =
-        uop.range(VTA_UOP_GEM_1_1, VTA_UOP_GEM_1_0) + src_offset_in;
-    wgt_idx_T wgt_idx =
-        uop.range(VTA_UOP_GEM_2_1, VTA_UOP_GEM_2_0) + wgt_offset_in;
+    // The input and weight memories are outside of this module: their indices
+    // are registered so that the adders are not in the same clock cycle as
+    // the routes to the memories
+    inp_idx_T src_idx = pipeline_reg(
+        uop.range(VTA_UOP_GEM_1_1, VTA_UOP_GEM_1_0) + src_offset_in);
+    wgt_idx_T wgt_idx = pipeline_reg(
+        uop.range(VTA_UOP_GEM_2_1, VTA_UOP_GEM_2_0) + wgt_offset_in);
 
     // Read in weight tensor
     wgt_T w_tensor[VTA_BLOCK_OUT][VTA_BLOCK_IN];
@@ -696,7 +723,7 @@ void alu(
 void compute(
   volatile uint32_t &done,
   bool &done_irq,
-  volatile uop_T *uops,
+  volatile bus_T *uops,
   volatile bus_T *biases,
   hls::stream<insn_T> &gemm_queue,
   hls::stream<bool> &l2g_dep_queue,
@@ -708,7 +735,9 @@ void compute(
   bus_T out_mem[VTA_ACC_BUFF_DEPTH][OUT_MAT_AXI_RATIO]) {
 PRAGMA_HLS(HLS INTERFACE s_axilite port = done bundle = CONTROL_BUS offset = VTA_COMPUTE_DONE_WR_OFFSET)
 #pragma HLS INTERFACE ap_none port = done_irq
-#pragma HLS INTERFACE m_axi port = uops offset = slave bundle = uop_port
+// The micro-ops and the biases are never read at the same time, so they share
+// the port (each one has its own base address register)
+#pragma HLS INTERFACE m_axi port = uops offset = slave bundle = data_port
 #pragma HLS INTERFACE m_axi port = biases offset = slave bundle = data_port
 #pragma HLS INTERFACE axis port = gemm_queue
 #pragma HLS INTERFACE axis port = l2g_dep_queue
@@ -764,10 +793,28 @@ PRAGMA_HLS(HLS INTERFACE s_axilite port = done bundle = CONTROL_BUS offset = VTA
     memop_sram_T y_offset_1 = pad_offset(x_width, insn.mem.y_pad_1);
 
     if (insn.mem.memory_type == VTA_MEM_ID_UOP) {
-      // Perform data transfer
-      memcpy(&uop_mem[sram_idx],
-             (const uop_T*) &uops[dram_idx],
-             insn.mem.x_size * sizeof(uop_T));
+      // Perform data transfer. The micro-ops are read one bus word at a time,
+      // each one holds VTA_BUS_WIDTH / VTA_UOP_WIDTH of them and only the ones
+      // in the range of the instruction are written (the first and the last
+      // bus word can be partial).
+      const int ratio = VTA_BUS_WIDTH / VTA_UOP_WIDTH;
+      ap_uint<VTA_MEMOP_DRAM_ADDR_BIT_WIDTH + 1> uop_bgn = dram_idx;
+      ap_uint<VTA_MEMOP_DRAM_ADDR_BIT_WIDTH + 1> uop_end = uop_bgn + insn.mem.x_size;
+      memop_dram_T word_bgn = uop_bgn / ratio;
+      memop_dram_T word_end = (uop_end + ratio - 1) / ratio;
+      for (memop_dram_T w = word_bgn; w < word_end; w++) {
+// Two micro-ops are written for each bus word
+#pragma HLS PIPELINE II = 2
+        bus_T word = uops[w];
+        for (int k = 0; k < ratio; k++) {
+          ap_uint<VTA_MEMOP_DRAM_ADDR_BIT_WIDTH + 1> idx =
+              (ap_uint<VTA_MEMOP_DRAM_ADDR_BIT_WIDTH + 1>) w * ratio + k;
+          if (idx >= uop_bgn && idx < uop_end) {
+            uop_mem[sram_idx + (memop_sram_T) (idx - uop_bgn)] =
+                (uop_T) (word >> (k * VTA_UOP_WIDTH));
+          }
+        }
+      }
     } else if (insn.mem.memory_type == VTA_MEM_ID_ACC ||
                insn.mem.memory_type == VTA_MEM_ID_ACC_8BIT) {
       // Perform data transfer from DRAM, the 8 bit elements (VTA_MEM_ID_ACC_8BIT)
@@ -850,15 +897,15 @@ void store(
 
 void vta(
   uint32_t insn_count,
-  volatile insn_T *insns,
-  volatile uop_T *uops,
+  volatile bus_T *insns,
+  volatile bus_T *uops,
   volatile bus_T *inputs,
   volatile bus_T *weights,
   volatile bus_T *biases,
   volatile bus_T *outputs) {
 #pragma HLS INTERFACE s_axilite port = insn_count bundle = CONTROL_BUS
 #pragma HLS INTERFACE m_axi port = insns offset = slave bundle = ins_port
-#pragma HLS INTERFACE m_axi port = uops offset = slave bundle = uop_port
+#pragma HLS INTERFACE m_axi port = uops offset = slave bundle = data_port
 #pragma HLS INTERFACE m_axi port = inputs offset = slave bundle = data_port
 #pragma HLS INTERFACE m_axi port = weights offset = slave bundle = data_port
 #pragma HLS INTERFACE m_axi port = biases offset = slave bundle = data_port

@@ -101,5 +101,10 @@ int main(void) {
     status |= acc8_load_test(6, 5, 2, 3, false);
     status |= acc8_load_test(6, 5, 2, 3, true);
 
+    // Load of the micro-ops with odd and even offsets and sizes
+    status |= uop_load_test(9, 3);
+    status |= uop_load_test(16, 3);
+    status |= uop_load_test(9, 4);
+
     return status;
 }
